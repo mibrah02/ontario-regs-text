@@ -1,7 +1,6 @@
 from __future__ import annotations
 import os
 from urllib.parse import quote
-from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -9,7 +8,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 
-from app.db import init_db, is_paid_user
+from app.db import (
+    clear_pending_clarification,
+    get_pending_clarification,
+    increment_free_question_count,
+    init_db,
+    is_paid_user,
+    set_pending_clarification,
+)
 from app.rag import answer_question, ensure_index
 from app.stripe import construct_event, get_checkout_url, handle_checkout_completed
 
@@ -17,12 +23,13 @@ from app.stripe import construct_event, get_checkout_url, handle_checkout_comple
 load_dotenv()
 
 FREE_QUESTION_LIMIT = 3
-free_question_counts: defaultdict[str, int] = defaultdict(int)
 DISCLAIMER = "Info only. Not legal advice. Verify current regs."
 NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Info only. Not legal advice. Verify current regs."
 TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
 PAYWALL_TEST_PREFIX = "PAYWALL "
 SEEDED_PAID_NUMBERS = {item.strip() for item in os.getenv("SEEDED_PAID_NUMBERS", "").split(",") if item.strip()}
+CLARIFICATION_PREFIX = "Your question matches multiple deer season entries in the 2026 Summary."
+METHOD_REPLY_TERMS = ("bow", "bows only", "rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")
 
 
 @asynccontextmanager
@@ -56,11 +63,35 @@ def _payment_entry_url(phone: str) -> str:
     return f"{base_url}/buy/{quote(_normalize_phone(phone), safe='')}"
 
 
-def _safe_answer(question: str) -> str:
+def _looks_like_method_reply(question: str) -> bool:
+    lowered = question.lower().strip()
+    return any(term in lowered for term in METHOD_REPLY_TERMS)
+
+
+def _question_with_clarification(from_number: str, question: str) -> str:
+    pending = get_pending_clarification(_normalize_phone(from_number))
+    if pending and _looks_like_method_reply(question):
+        clear_pending_clarification(_normalize_phone(from_number))
+        return f"{pending} {question}"
+    return question
+
+
+def _track_clarification(from_number: str, original_question: str, reply_text: str) -> None:
+    key = _normalize_phone(from_number)
+    if reply_text.startswith(CLARIFICATION_PREFIX):
+        set_pending_clarification(key, original_question)
+    else:
+        clear_pending_clarification(key)
+
+
+def _safe_answer(from_number: str, question: str) -> str:
+    effective_question = _question_with_clarification(from_number, question)
     try:
-        return answer_question(question)
+        reply_text = answer_question(effective_question)
     except Exception:
-        return NOT_FOUND_RESPONSE
+        reply_text = NOT_FOUND_RESPONSE
+    _track_clarification(from_number, effective_question, reply_text)
+    return reply_text
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
@@ -72,14 +103,14 @@ def build_sms_reply(from_number: str, question: str) -> str:
             return "Free limit reached. Payment link unavailable. Try again later."
 
     if _is_test_bypass_number(from_number):
-        return _safe_answer(question)
+        return _safe_answer(from_number, question)
 
     if _is_seeded_paid_number(from_number) or is_paid_user(from_number):
-        return _safe_answer(question)
+        return _safe_answer(from_number, question)
 
-    free_question_counts[from_number] += 1
-    if free_question_counts[from_number] <= FREE_QUESTION_LIMIT:
-        return _safe_answer(question)
+    free_count = increment_free_question_count(_normalize_phone(from_number))
+    if free_count <= FREE_QUESTION_LIMIT:
+        return _safe_answer(from_number, question)
 
     try:
         checkout_url = get_checkout_url(from_number)

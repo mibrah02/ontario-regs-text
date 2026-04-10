@@ -6,7 +6,7 @@ Production-ready SMS bot for Ontario hunting regulation questions. The bot only 
 
 - FastAPI app with `/sms`, `/stripe`, and `/health`
 - PDF-to-FAISS indexing pipeline using LangChain + OpenAI embeddings
-- SQLite paid-user tracking
+- SQLAlchemy-backed app state with SQLite by default and Postgres-ready configuration
 - Stripe Checkout subscription flow for `$49 CAD / year`
 - Local SMS webhook simulation script
 - Railway-friendly startup config via `Procfile`
@@ -119,7 +119,9 @@ https://<your-domain>/stripe
    - `BASE_URL`
    - `SOURCE_PDF_PATH=data/2026-ontario-hunting-regulations-summary.pdf`
    - `FAISS_INDEX_DIR=data`
+   - `DATABASE_URL=sqlite+pysqlite:///data/app.db`
    - `SQLITE_DB_PATH=data/app.db`
+   - `CLARIFICATION_TTL_MINUTES=30`
 5. In Railway shell or predeploy command, build the index once:
 
 ```bash
@@ -140,8 +142,8 @@ curl -X POST http://127.0.0.1:8000/sms \
 
 ## Notes
 
-- Free usage is tracked in memory and resets on restart.
-- Paid usage is tracked in SQLite.
+- Free usage and clarification state are stored in the database.
+- The default database is SQLite, but the app is wired to accept a Postgres `DATABASE_URL`.
 - The bot never uses outside knowledge by design.
 - If retrieval is unclear, it must return the `Not found in 2026 Summary...` fallback.
 - Stripe webhook setup can wait until after deployment, when you have the real public `/stripe` URL.

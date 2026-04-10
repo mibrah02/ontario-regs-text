@@ -23,7 +23,17 @@ def main() -> None:
         f"https://checkout.stripe.com/pay/demo?client_reference_id={phone}"
     )
     main_module.is_paid_user = lambda phone: False
-    main_module.free_question_counts.clear()
+    main_module.get_pending_clarification = lambda phone: None
+    main_module.set_pending_clarification = lambda phone, question: None
+    main_module.clear_pending_clarification = lambda phone: None
+
+    counter = {"count": 0}
+
+    def fake_increment_free_question_count(phone: str) -> int:
+        counter["count"] += 1
+        return counter["count"]
+
+    main_module.increment_free_question_count = fake_increment_free_question_count
 
     client = TestClient(main_module.app)
 

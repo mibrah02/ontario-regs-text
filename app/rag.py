@@ -46,6 +46,19 @@ SKIP_LINE_RE = re.compile(
 )
 
 
+SPECIES_PATTERNS = {
+    "white-tailed deer": "deer",
+    "deer": "deer",
+    "moose": "moose",
+    "black bear": "bear",
+    "bear": "bear",
+    "wild turkey": "turkey",
+    "turkey": "turkey",
+    "elk": "elk",
+    "wolf": "wolf",
+    "coyote": "coyote",
+}
+
 def _get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(model="text-embedding-3-small")
 
@@ -75,6 +88,71 @@ def _normalize_model_output(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
     return text.strip()
+
+
+def _infer_species(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern, label in SPECIES_PATTERNS.items():
+        if pattern in lowered:
+            return label
+    return None
+
+
+def _extract_species_terms(question: str) -> set[str]:
+    lowered = question.lower()
+    return {label for pattern, label in SPECIES_PATTERNS.items() if pattern in lowered}
+
+
+def _extract_wmu_terms(question: str) -> set[str]:
+    return {match.upper() for match in re.findall(r"\b(?:WMU\s*)?(\d{1,3}[A-Z]?)\b", question, re.IGNORECASE)}
+
+
+def _extract_method_terms(question: str) -> set[str]:
+    lowered = question.lower()
+    terms = set()
+    if "bows only" in lowered or "bow" in lowered:
+        terms.add("bows only")
+    if any(term in lowered for term in ("rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")):
+        terms.add("guns")
+    return terms
+
+
+def _doc_matches_wmu(document: Document, wmu_terms: set[str]) -> bool:
+    content = document.page_content.upper()
+    return any(re.search(rf"^\s*{re.escape(term)}(?:\b|,)", content) for term in wmu_terms)
+
+
+def _doc_matches_method(document: Document, method_terms: set[str]) -> bool:
+    context = document.metadata.get("table_context", "").lower()
+    if not method_terms:
+        return True
+    if "bows only" in method_terms and "bows only" in context:
+        return True
+    if "guns" in method_terms and "rifles, shotguns, muzzle-loading guns and bows" in context:
+        return True
+    return False
+
+
+def _direct_structured_match(vectorstore: FAISS, question: str) -> list[Document]:
+    species_terms = _extract_species_terms(question)
+    wmu_terms = _extract_wmu_terms(question)
+    method_terms = _extract_method_terms(question)
+    if not species_terms or not wmu_terms or not method_terms:
+        return []
+
+    candidates: list[Document] = []
+    for document in vectorstore.docstore._dict.values():
+        if document.metadata.get("chunk_type") != "table_row":
+            continue
+        if species_terms and document.metadata.get("species") not in species_terms:
+            continue
+        if not _doc_matches_wmu(document, wmu_terms):
+            continue
+        if not _doc_matches_method(document, method_terms):
+            continue
+        candidates.append(document)
+
+    return candidates[:3]
 
 
 def _extract_paragraph_chunks(page_text: str) -> list[str]:
@@ -160,6 +238,9 @@ def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
             "year": 2026,
             "url": PDF_URL,
         }
+        species = _infer_species(page_text)
+        if species:
+            metadata["species"] = species
 
         documents.append(
             Document(
@@ -236,14 +317,14 @@ def _extract_query_terms(question: str) -> set[str]:
 
 def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
     query_terms = _extract_query_terms(question)
-    if not query_terms:
-        return documents
+    species_terms = _extract_species_terms(question)
 
-    def sort_key(document: Document) -> tuple[int, int]:
+    def sort_key(document: Document) -> tuple[int, int, int]:
         content = document.page_content.upper()
         overlap = sum(1 for term in query_terms if term in content)
         table_bonus = 1 if document.metadata.get("chunk_type") == "table_row" else 0
-        return (overlap, table_bonus)
+        species_bonus = 1 if species_terms and document.metadata.get("species") in species_terms else 0
+        return (species_bonus, overlap, table_bonus)
 
     return sorted(documents, key=sort_key, reverse=True)
 
@@ -317,9 +398,13 @@ def answer_question(question: str) -> str:
         return "Your question matches multiple deer season entries in the 2026 Summary. Specify a method, for example bows only or rifles/shotguns/muzzle-loading guns and bows. Informational only. Not legal advice. Verify current regs."
 
     vectorstore = _load_vectorstore()
-    retrieval_query = _rewrite_search_query(question)
-    results = vectorstore.similarity_search(retrieval_query, k=8)
-    results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
+    direct_matches = _direct_structured_match(vectorstore, question)
+    if direct_matches:
+        results = direct_matches
+    else:
+        retrieval_query = _rewrite_search_query(question)
+        results = vectorstore.similarity_search(retrieval_query, k=8)
+        results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
     if _results_are_ambiguous(question, results):
         return _ambiguity_clarification(results)
 
