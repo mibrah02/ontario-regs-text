@@ -22,6 +22,7 @@ DISCLAIMER = "Info only. Not legal advice. Verify current regs."
 NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Info only. Not legal advice. Verify current regs."
 TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
 PAYWALL_TEST_PREFIX = "PAYWALL "
+SEEDED_PAID_NUMBERS = {item.strip() for item in os.getenv("SEEDED_PAID_NUMBERS", "").split(",") if item.strip()}
 
 
 @asynccontextmanager
@@ -43,6 +44,11 @@ def _normalize_phone(phone: str) -> str:
 
 def _is_test_bypass_number(phone: str) -> bool:
     return _normalize_phone(phone) == _normalize_phone(TEST_BYPASS_PHONE)
+
+
+def _is_seeded_paid_number(phone: str) -> bool:
+    normalized = _normalize_phone(phone)
+    return any(normalized == _normalize_phone(item) for item in SEEDED_PAID_NUMBERS)
 
 
 def _payment_entry_url(phone: str) -> str:
@@ -68,7 +74,7 @@ def build_sms_reply(from_number: str, question: str) -> str:
     if _is_test_bypass_number(from_number):
         return _safe_answer(question)
 
-    if is_paid_user(from_number):
+    if _is_seeded_paid_number(from_number) or is_paid_user(from_number):
         return _safe_answer(question)
 
     free_question_counts[from_number] += 1
