@@ -24,12 +24,19 @@ User question: {question}
 Relevant pages: {pages}
 If the answer is clearly on these pages, return the shortest exact quote that answers the question.
 If the source is a table, return only the exact matching row or cell text needed, not the whole table.
+Use the provided table context to distinguish between different season tables or weapon types.
+If multiple relevant entries differ by method, season type, or weapon and the user did not specify enough detail, reply with the not-found fallback.
 Preserve source wording, but collapse repeated spaces and line breaks into normal readable spaces.
 Reply with EXACTLY this format:
 '2026 Ontario Hunting Regulations Summary, p.{{page}}: "{{exact sentence from PDF}}" ontario.ca/hunting
 Informational only. Not legal advice. Verify current regs.'
 If not found, reply: 'Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs.'
 Do not add anything else."""
+SEARCH_REWRITE_PROMPT = """Rewrite the user question into a short search query for the 2026 Ontario Hunting Regulations Summary.
+Keep species names, WMU numbers, season concepts, licence concepts, and gear terms when relevant.
+Do not answer the question. Do not add commentary. Return one short search query only.
+User question: {question}
+"""
 
 WMU_ROW_START_RE = re.compile(r"^(?:\d{1,3}[A-Z]?)(?:,\s*\d{1,3}[A-Z]?)*(?:\s*,\s*\d{1,3}[A-Z]?)*\b")
 TABLE_PAGE_MARKERS = ("Wildlife Management Unit", "Resident — open season", "Resident - open season")
@@ -44,6 +51,10 @@ def _get_embeddings() -> OpenAIEmbeddings:
 
 
 def _get_chat_model() -> ChatOpenAI:
+    return ChatOpenAI(model="gpt-4o", temperature=0)
+
+
+def _get_rewrite_model() -> ChatOpenAI:
     return ChatOpenAI(model="gpt-4o", temperature=0)
 
 
@@ -79,6 +90,22 @@ def _looks_like_wmu_row_start(line: str) -> bool:
     if not WMU_ROW_START_RE.match(line):
         return False
     return not line.lower().startswith(("resident", "non-resident"))
+
+
+def _extract_table_context(page_text: str) -> str:
+    if not any(marker in page_text for marker in TABLE_PAGE_MARKERS):
+        return ""
+
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    context_lines: list[str] = []
+    for line in lines:
+        if SKIP_LINE_RE.match(line):
+            continue
+        if _looks_like_wmu_row_start(line):
+            break
+        context_lines.append(line)
+
+    return _normalize_inline("\n".join(context_lines[:6]))
 
 
 def _extract_table_row_chunks(page_text: str) -> list[str]:
@@ -149,11 +176,15 @@ def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
                 )
             )
 
+        table_context = _extract_table_context(page_text)
         for row in _extract_table_row_chunks(page_text):
+            row_metadata = {**metadata, "chunk_type": "table_row"}
+            if table_context:
+                row_metadata["table_context"] = table_context
             documents.append(
                 Document(
                     page_content=row,
-                    metadata={**metadata, "chunk_type": "table_row"},
+                    metadata=row_metadata,
                 )
             )
 
@@ -190,6 +221,15 @@ def _load_vectorstore() -> FAISS:
 
 
 
+def _rewrite_search_query(question: str) -> str:
+    try:
+        response = _get_rewrite_model().invoke(SEARCH_REWRITE_PROMPT.format(question=question))
+        rewritten = _normalize_inline(response.content)
+        return rewritten or question
+    except Exception:
+        return question
+
+
 def _extract_query_terms(question: str) -> set[str]:
     return {match.upper() for match in re.findall(r"\b[0-9]{1,3}[A-Z]?\b", question)}
 
@@ -207,6 +247,56 @@ def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
 
     return sorted(documents, key=sort_key, reverse=True)
 
+METHOD_TERMS = ("bow", "bows", "rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")
+
+
+def _question_specifies_method(question: str) -> bool:
+    lowered = question.lower()
+    return any(term in lowered for term in METHOD_TERMS)
+
+
+
+
+def _needs_season_clarification(question: str) -> bool:
+    lowered = question.lower()
+    has_wmu = bool(re.search(r"\bwmu\s*\d{1,3}[a-z]?\b", lowered)) or " wildlife management unit " in f" {lowered} "
+    asks_season = "season" in lowered
+    mentions_deer = "deer" in lowered
+    return has_wmu and asks_season and mentions_deer and not _question_specifies_method(question)
+
+def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
+    if _question_specifies_method(question):
+        return False
+
+    contexts = {
+        document.metadata.get("table_context", "")
+        for document in documents
+        if document.metadata.get("chunk_type") == "table_row" and document.metadata.get("table_context")
+    }
+    return len(contexts) > 1
+
+
+
+
+def _ambiguity_clarification(documents: list[Document]) -> str:
+    contexts = [
+        document.metadata.get("table_context", "")
+        for document in documents
+        if document.metadata.get("chunk_type") == "table_row" and document.metadata.get("table_context")
+    ]
+    joined = " ".join(contexts).lower()
+
+    options: list[str] = []
+    if "bows only" in joined:
+        options.append("bows only")
+    if "rifles, shotguns, muzzle-loading guns and bows" in joined:
+        options.append("rifles, shotguns, muzzle-loading guns and bows")
+
+    if not options:
+        return "Your question matches multiple entries in the 2026 Summary. Specify the hunting method or season type. Informational only. Not legal advice. Verify current regs."
+
+    return f"Your question matches multiple entries in the 2026 Summary. Specify one of: {', '.join(options)}. Informational only. Not legal advice. Verify current regs."
+
 def _format_pages(documents: list[Document]) -> str:
     formatted_pages: list[dict[str, Any]] = []
     for document in documents:
@@ -215,6 +305,7 @@ def _format_pages(documents: list[Document]) -> str:
                 "page": document.metadata.get("page_num"),
                 "chunk_type": document.metadata.get("chunk_type"),
                 "url": document.metadata.get("url", PDF_URL),
+                "context": document.metadata.get("table_context", ""),
                 "text": _normalize_page_text(document.page_content),
             }
         )
@@ -222,9 +313,16 @@ def _format_pages(documents: list[Document]) -> str:
 
 
 def answer_question(question: str) -> str:
+    if _needs_season_clarification(question):
+        return "Your question matches multiple deer season entries in the 2026 Summary. Specify a method, for example bows only or rifles/shotguns/muzzle-loading guns and bows. Informational only. Not legal advice. Verify current regs."
+
     vectorstore = _load_vectorstore()
-    results = vectorstore.similarity_search(question, k=8)
-    results = _rerank_results(question, results)[:3]
+    retrieval_query = _rewrite_search_query(question)
+    results = vectorstore.similarity_search(retrieval_query, k=8)
+    results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
+    if _results_are_ambiguous(question, results):
+        return _ambiguity_clarification(results)
+
     prompt = SYSTEM_PROMPT.format(
         question=question,
         pages=_format_pages(results),
