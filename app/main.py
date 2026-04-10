@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 
 from app.db import init_db, is_paid_user
-from app.rag import answer_question
+from app.rag import answer_question, ensure_index
 from app.stripe import construct_event, get_checkout_url, handle_checkout_completed
 
 
@@ -22,6 +22,7 @@ DISCLAIMER = "Informational only. Not legal advice. Verify current regs."
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    ensure_index()
     yield
 
 

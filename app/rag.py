@@ -69,6 +69,12 @@ def build_index(pdf_path: str | Path = DEFAULT_PDF_PATH) -> None:
     vectorstore.save_local(str(INDEX_DIR))
 
 
+def ensure_index() -> None:
+    if (INDEX_DIR / "index.faiss").exists():
+        return
+    build_index()
+
+
 def _load_vectorstore() -> FAISS:
     if not (INDEX_DIR / "index.faiss").exists():
         raise FileNotFoundError(
