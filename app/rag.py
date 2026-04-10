@@ -31,6 +31,13 @@ Informational only. Not legal advice. Verify current regs.'
 If not found, reply: 'Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs.'
 Do not add anything else."""
 
+WMU_ROW_START_RE = re.compile(r"^(?:\d{1,3}[A-Z]?)(?:,\s*\d{1,3}[A-Z]?)*(?:\s*,\s*\d{1,3}[A-Z]?)*\b")
+TABLE_PAGE_MARKERS = ("Wildlife Management Unit", "Resident — open season", "Resident - open season")
+SKIP_LINE_RE = re.compile(
+    r"^(?:Hunting Regulations Summary|White-tailed Deer|Wildlife Management Unit|Resident|Non-resident|General Regulations|\d+)$",
+    re.IGNORECASE,
+)
+
 
 def _get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(model="text-embedding-3-small")
@@ -41,17 +48,75 @@ def _get_chat_model() -> ChatOpenAI:
 
 
 def _normalize_page_text(text: str) -> str:
-    text = text.replace(" ", " ")
-    text = re.sub(r"[ 	]+", " ", text)
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n+", "\n", text)
     return text.strip()
 
 
+def _normalize_inline(text: str) -> str:
+    text = _normalize_page_text(text)
+    return re.sub(r" ?\n ?", " ", text).strip()
+
+
 def _normalize_model_output(text: str) -> str:
-    text = text.replace(" ", " ")
-    text = re.sub(r"[ 	]+", " ", text)
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
     return text.strip()
+
+
+def _extract_paragraph_chunks(page_text: str) -> list[str]:
+    paragraphs: list[str] = []
+    for block in page_text.split("\n\n"):
+        cleaned = _normalize_inline(block)
+        if len(cleaned) >= 80:
+            paragraphs.append(cleaned)
+    return paragraphs
+
+
+def _looks_like_wmu_row_start(line: str) -> bool:
+    if not WMU_ROW_START_RE.match(line):
+        return False
+    return not line.lower().startswith(("resident", "non-resident"))
+
+
+def _extract_table_row_chunks(page_text: str) -> list[str]:
+    if not any(marker in page_text for marker in TABLE_PAGE_MARKERS):
+        return []
+
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    rows: list[str] = []
+    current: list[str] = []
+
+    for line in lines:
+        if SKIP_LINE_RE.match(line):
+            continue
+        if line.startswith("*"):
+            if current:
+                rows.append(_normalize_inline("\n".join(current)))
+                current = []
+            continue
+
+        if _looks_like_wmu_row_start(line):
+            if current:
+                rows.append(_normalize_inline("\n".join(current)))
+            current = [line]
+            continue
+
+        if current:
+            current.append(line)
+
+    if current:
+        rows.append(_normalize_inline("\n".join(current)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row not in seen and len(row) >= 30:
+            deduped.append(row)
+            seen.add(row)
+    return deduped
 
 
 def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
@@ -63,16 +128,34 @@ def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
         if not page_text:
             continue
 
+        metadata = {
+            "page_num": index,
+            "year": 2026,
+            "url": PDF_URL,
+        }
+
         documents.append(
             Document(
                 page_content=page_text,
-                metadata={
-                    "page_num": index,
-                    "year": 2026,
-                    "url": PDF_URL,
-                },
+                metadata={**metadata, "chunk_type": "page"},
             )
         )
+
+        for paragraph in _extract_paragraph_chunks(page_text):
+            documents.append(
+                Document(
+                    page_content=paragraph,
+                    metadata={**metadata, "chunk_type": "paragraph"},
+                )
+            )
+
+        for row in _extract_table_row_chunks(page_text):
+            documents.append(
+                Document(
+                    page_content=row,
+                    metadata={**metadata, "chunk_type": "table_row"},
+                )
+            )
 
     if not documents:
         raise ValueError("No text could be extracted from the PDF.")
@@ -106,12 +189,31 @@ def _load_vectorstore() -> FAISS:
     )
 
 
+
+def _extract_query_terms(question: str) -> set[str]:
+    return {match.upper() for match in re.findall(r"\b[0-9]{1,3}[A-Z]?\b", question)}
+
+
+def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
+    query_terms = _extract_query_terms(question)
+    if not query_terms:
+        return documents
+
+    def sort_key(document: Document) -> tuple[int, int]:
+        content = document.page_content.upper()
+        overlap = sum(1 for term in query_terms if term in content)
+        table_bonus = 1 if document.metadata.get("chunk_type") == "table_row" else 0
+        return (overlap, table_bonus)
+
+    return sorted(documents, key=sort_key, reverse=True)
+
 def _format_pages(documents: list[Document]) -> str:
     formatted_pages: list[dict[str, Any]] = []
     for document in documents:
         formatted_pages.append(
             {
                 "page": document.metadata.get("page_num"),
+                "chunk_type": document.metadata.get("chunk_type"),
                 "url": document.metadata.get("url", PDF_URL),
                 "text": _normalize_page_text(document.page_content),
             }
@@ -121,7 +223,8 @@ def _format_pages(documents: list[Document]) -> str:
 
 def answer_question(question: str) -> str:
     vectorstore = _load_vectorstore()
-    results = vectorstore.similarity_search(question, k=3)
+    results = vectorstore.similarity_search(question, k=8)
+    results = _rerank_results(question, results)[:3]
     prompt = SYSTEM_PROMPT.format(
         question=question,
         pages=_format_pages(results),
