@@ -1,10 +1,11 @@
 from __future__ import annotations
 import os
+from urllib.parse import quote
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -44,6 +45,11 @@ def _is_test_bypass_number(phone: str) -> bool:
     return _normalize_phone(phone) == _normalize_phone(TEST_BYPASS_PHONE)
 
 
+def _payment_entry_url(phone: str) -> str:
+    base_url = os.environ["BASE_URL"].rstrip("/")
+    return f"{base_url}/buy/{quote(_normalize_phone(phone), safe='')}"
+
+
 def _safe_answer(question: str) -> str:
     try:
         return answer_question(question)
@@ -55,9 +61,9 @@ def build_sms_reply(from_number: str, question: str) -> str:
     if question.startswith(PAYWALL_TEST_PREFIX):
         try:
             checkout_url = get_checkout_url(from_number)
-            return f"First 3 free. Unlimited: {checkout_url} {DISCLAIMER}"
+            return f"First 3 free. Unlimited: {_payment_entry_url(from_number)}"
         except Exception:
-            return f"Free limit reached. Payment link unavailable. Try again later. {DISCLAIMER}"
+            return "Free limit reached. Payment link unavailable. Try again later."
 
     if _is_test_bypass_number(from_number):
         return _safe_answer(question)
@@ -71,9 +77,9 @@ def build_sms_reply(from_number: str, question: str) -> str:
 
     try:
         checkout_url = get_checkout_url(from_number)
-        return f"First 3 free. Unlimited: {checkout_url} {DISCLAIMER}"
+        return f"First 3 free. Unlimited: {_payment_entry_url(from_number)}"
     except Exception:
-        return f"Free limit reached. Payment link unavailable. Try again later. {DISCLAIMER}"
+        return "Free limit reached. Payment link unavailable. Try again later."
 
 
 @app.get("/health")
@@ -94,6 +100,11 @@ async def checkout_success() -> HTMLResponse:
         </html>
         """
     )
+
+
+@app.get("/buy/{phone}")
+async def buy_redirect(phone: str) -> RedirectResponse:
+    return RedirectResponse(get_checkout_url(phone), status_code=303)
 
 
 @app.get("/cancel")
