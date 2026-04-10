@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -16,8 +17,10 @@ load_dotenv()
 
 FREE_QUESTION_LIMIT = 3
 free_question_counts: defaultdict[str, int] = defaultdict(int)
-DISCLAIMER = "Informational only. Not legal advice. Verify current regs."
-NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs."
+DISCLAIMER = "Info only. Not legal advice. Verify current regs."
+NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Info only. Not legal advice. Verify current regs."
+TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
+PAYWALL_TEST_PREFIX = "PAYWALL "
 
 
 @asynccontextmanager
@@ -30,14 +33,31 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Ontario Regs Text", lifespan=lifespan)
 
 
+def _normalize_phone(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) == 10:
+        digits = "1" + digits
+    return f"+{digits}" if digits else phone
+
+
+def _is_test_bypass_number(phone: str) -> bool:
+    return _normalize_phone(phone) == _normalize_phone(TEST_BYPASS_PHONE)
+
+
 def _safe_answer(question: str) -> str:
     try:
-        return _safe_answer(question)
+        return answer_question(question)
     except Exception:
         return NOT_FOUND_RESPONSE
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
+    if _is_test_bypass_number(from_number) and not question.startswith(PAYWALL_TEST_PREFIX):
+        return _safe_answer(question)
+
+    if question.startswith(PAYWALL_TEST_PREFIX):
+        question = question[len(PAYWALL_TEST_PREFIX):].strip() or "Test paywall"
+
     if is_paid_user(from_number):
         return _safe_answer(question)
 
@@ -47,9 +67,9 @@ def build_sms_reply(from_number: str, question: str) -> str:
 
     try:
         checkout_url = get_checkout_url(from_number)
-        return f"First 3 questions free. Unlimited: {checkout_url} {DISCLAIMER}"
+        return f"First 3 free. Unlimited: {checkout_url} {DISCLAIMER}"
     except Exception:
-        return f"First 3 questions free. Payment link temporarily unavailable. {DISCLAIMER}"
+        return f"Free limit reached. Payment link unavailable. Try again later. {DISCLAIMER}"
 
 
 @app.get("/health")
