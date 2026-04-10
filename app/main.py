@@ -17,6 +17,7 @@ load_dotenv()
 FREE_QUESTION_LIMIT = 3
 free_question_counts: defaultdict[str, int] = defaultdict(int)
 DISCLAIMER = "Informational only. Not legal advice. Verify current regs."
+NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs."
 
 
 @asynccontextmanager
@@ -29,16 +30,26 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Ontario Regs Text", lifespan=lifespan)
 
 
+def _safe_answer(question: str) -> str:
+    try:
+        return _safe_answer(question)
+    except Exception:
+        return NOT_FOUND_RESPONSE
+
+
 def build_sms_reply(from_number: str, question: str) -> str:
     if is_paid_user(from_number):
-        return answer_question(question)
+        return _safe_answer(question)
 
     free_question_counts[from_number] += 1
     if free_question_counts[from_number] <= FREE_QUESTION_LIMIT:
-        return answer_question(question)
+        return _safe_answer(question)
 
-    checkout_url = get_checkout_url(from_number)
-    return f"First 3 questions free. Unlimited: {checkout_url} {DISCLAIMER}"
+    try:
+        checkout_url = get_checkout_url(from_number)
+        return f"First 3 questions free. Unlimited: {checkout_url} {DISCLAIMER}"
+    except Exception:
+        return f"First 3 questions free. Payment link temporarily unavailable. {DISCLAIMER}"
 
 
 @app.get("/health")
