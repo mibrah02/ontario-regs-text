@@ -52,11 +52,15 @@ def _safe_answer(question: str) -> str:
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
-    if _is_test_bypass_number(from_number) and not question.startswith(PAYWALL_TEST_PREFIX):
-        return _safe_answer(question)
-
     if question.startswith(PAYWALL_TEST_PREFIX):
-        question = question[len(PAYWALL_TEST_PREFIX):].strip() or "Test paywall"
+        try:
+            checkout_url = get_checkout_url(from_number)
+            return f"First 3 free. Unlimited: {checkout_url} {DISCLAIMER}"
+        except Exception:
+            return f"Free limit reached. Payment link unavailable. Try again later. {DISCLAIMER}"
+
+    if _is_test_bypass_number(from_number):
+        return _safe_answer(question)
 
     if is_paid_user(from_number):
         return _safe_answer(question)
