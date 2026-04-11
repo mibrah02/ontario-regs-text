@@ -36,6 +36,18 @@ class RagClarificationTests(unittest.TestCase):
         self.assertEqual(result.expected_detail, "topic")
         self.assertIn("rabbit daily limit", result.text)
 
+    def test_broad_deer_rules_question_requests_specific_topic(self) -> None:
+        result = answer_question_result("what deer hunting rules")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "topic")
+        self.assertIn("deer daily limit", result.text)
+
+    def test_broad_general_hunting_rules_question_requests_specific_topic(self) -> None:
+        result = answer_question_result("what hunting rules")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "topic")
+        self.assertIn("deer season in WMU 65", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

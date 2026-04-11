@@ -387,8 +387,19 @@ def _is_deer_season_question(question: str) -> bool:
     return "deer" in lowered and "season" in lowered
 
 
-BROAD_RULE_TERMS = ("rule", "rules", "regulation", "regulations")
-SPECIFIC_RULE_TERMS = (
+BROAD_QUERY_TERMS = (
+    "rule",
+    "rules",
+    "regulation",
+    "regulations",
+    "hunt",
+    "hunting",
+    "allowed",
+    "what about",
+    "what are",
+    "what is",
+)
+TOPIC_HINT_TERMS = (
     "season",
     "limit",
     "daily",
@@ -409,6 +420,13 @@ SPECIFIC_RULE_TERMS = (
     "shotgun",
     "muzzle",
     "sunday",
+    "date",
+    "dates",
+    "resident",
+    "nonresident",
+    "non-resident",
+    "calf",
+    "antlerless",
 )
 
 
@@ -426,21 +444,42 @@ def _pretty_species_name(label: str) -> str:
     return names.get(label, label)
 
 
-def _broad_species_rules_clarification(question: str) -> AnswerOutcome | None:
+def _broad_species_question_clarification(question: str) -> AnswerOutcome | None:
     lowered = question.lower()
-    if not any(term in lowered for term in BROAD_RULE_TERMS):
-        return None
-    if any(term in lowered for term in SPECIFIC_RULE_TERMS):
+    if any(term in lowered for term in TOPIC_HINT_TERMS):
         return None
 
     species_terms = _extract_species_terms(question)
     if len(species_terms) != 1:
         return None
 
+    word_count = len(re.findall(r"\w+", lowered))
+    has_broad_cue = any(term in lowered for term in BROAD_QUERY_TERMS)
+    if not has_broad_cue and word_count > 3:
+        return None
+
     species = next(iter(species_terms))
     species_name = _pretty_species_name(species)
     return _clarification_outcome(
         f"Ask one specific {species_name} question, for example: {species_name} daily limit, {species_name} possession limit, or {species_name} season in my WMU. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "topic",
+    )
+
+
+def _broad_general_question_clarification(question: str) -> AnswerOutcome | None:
+    lowered = question.lower()
+    if any(term in lowered for term in TOPIC_HINT_TERMS):
+        return None
+
+    word_count = len(re.findall(r"\w+", lowered))
+    if word_count > 5:
+        return None
+    if not any(term in lowered for term in BROAD_QUERY_TERMS):
+        return None
+
+    return _clarification_outcome(
+        "Ask one specific Ontario hunting question, for example: deer season in WMU 65, rabbit daily limit, or hunter orange requirement. Informational only. Not legal advice. Verify current regs.",
         question,
         "topic",
     )
@@ -539,9 +578,13 @@ def _format_pages(documents: list[Document]) -> str:
 
 
 def answer_question_result(question: str) -> AnswerOutcome:
-    broad_rules = _broad_species_rules_clarification(question)
-    if broad_rules:
-        return broad_rules
+    broad_species = _broad_species_question_clarification(question)
+    if broad_species:
+        return broad_species
+
+    broad_general = _broad_general_question_clarification(question)
+    if broad_general:
+        return broad_general
 
     missing_details = _missing_deer_season_details(question)
     if missing_details:
