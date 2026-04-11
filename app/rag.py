@@ -87,7 +87,40 @@ def _normalize_model_output(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
-    return text.strip()
+    text = text.strip()
+    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
+        text = text[1:-1].strip()
+    return text
+
+
+def _compress_repeated_table_row(text: str) -> str:
+    match = WMU_ROW_START_RE.match(text)
+    if not match:
+        return text
+
+    prefix = match.group(0).strip()
+    remainder = text[match.end():].strip()
+    tokens = remainder.split()
+    if not tokens or len(tokens) % 2 != 0:
+        return text
+
+    midpoint = len(tokens) // 2
+    if tokens[:midpoint] != tokens[midpoint:]:
+        return text
+
+    return f"{prefix} {' '.join(tokens[:midpoint])}".strip()
+
+
+def _format_exact_quote(document: Document) -> str:
+    page = document.metadata.get("page_num", "?")
+    quote = _normalize_inline(document.page_content)
+    if document.metadata.get("chunk_type") == "table_row":
+        quote = _compress_repeated_table_row(quote)
+    quote = quote.replace('"', '\\"')
+    return (
+        f'2026 Ontario Hunting Regulations Summary, p.{page}: "{quote}" ontario.ca/hunting\n'
+        "Informational only. Not legal advice. Verify current regs."
+    )
 
 
 def _infer_species(text: str) -> str | None:
@@ -400,6 +433,8 @@ def answer_question(question: str) -> str:
     vectorstore = _load_vectorstore()
     direct_matches = _direct_structured_match(vectorstore, question)
     if direct_matches:
+        if len(direct_matches) == 1:
+            return _format_exact_quote(direct_matches[0])
         results = direct_matches
     else:
         retrieval_query = _rewrite_search_query(question)
