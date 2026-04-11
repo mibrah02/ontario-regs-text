@@ -15,7 +15,7 @@ import app.main as main_module
 def main() -> None:
     # Keep the test local and deterministic by replacing networked services.
     main_module.answer_question = lambda question: (
-        '2026 Ontario Hunting Regulations Summary, p.12: '
+        "2026 Ontario Hunting Regulations Summary, p.12: "
         '"Sample exact sentence from PDF." ontario.ca/hunting\n'
         "Informational only. Not legal advice. Verify current regs."
     )
@@ -26,6 +26,19 @@ def main() -> None:
     main_module.get_pending_clarification = lambda phone: None
     main_module.set_pending_clarification = lambda phone, question: None
     main_module.clear_pending_clarification = lambda phone: None
+    main_module.is_event_processed = lambda provider, event_id: False
+    main_module.mark_event_processed = lambda provider, event_id, event_type: None
+
+    cached_replies: dict[str, str] = {}
+
+    def fake_get_cached_sms_reply(message_sid: str) -> str | None:
+        return cached_replies.get(message_sid)
+
+    def fake_cache_sms_reply(message_sid: str, phone: str, body: str, reply_text: str) -> None:
+        cached_replies[message_sid] = reply_text
+
+    main_module.get_cached_sms_reply = fake_get_cached_sms_reply
+    main_module.cache_sms_reply = fake_cache_sms_reply
 
     counter = {"count": 0}
 
@@ -43,11 +56,24 @@ def main() -> None:
             data={
                 "From": "+12895550123",
                 "Body": "Can I hunt deer on Sundays in Ontario?",
+                "MessageSid": f"SM{attempt}",
             },
         )
         print(f"Attempt {attempt} status: {response.status_code}")
         print(response.text)
         print("-" * 40)
+
+    duplicate = client.post(
+        "/sms",
+        data={
+            "From": "+12895550123",
+            "Body": "Can I hunt deer on Sundays in Ontario?",
+            "MessageSid": "SM4",
+        },
+    )
+    print(f"Duplicate status: {duplicate.status_code}")
+    print(duplicate.text)
+    print("Counter after duplicate:", counter["count"])
 
 
 if __name__ == "__main__":

@@ -9,11 +9,15 @@ from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 
 from app.db import (
+    cache_sms_reply,
     clear_pending_clarification,
+    get_cached_sms_reply,
     get_pending_clarification,
     increment_free_question_count,
     init_db,
+    is_event_processed,
     is_paid_user,
+    mark_event_processed,
     set_pending_clarification,
 )
 from app.rag import answer_question, ensure_index
@@ -163,13 +167,25 @@ async def sms_webhook(request: Request) -> PlainTextResponse:
     form = await request.form()
     from_number = str(form.get("From", "")).strip()
     question = str(form.get("Body", "")).strip()
+    message_sid = str(form.get("MessageSid", "")).strip()
 
     if not from_number:
         raise HTTPException(status_code=400, detail="Missing From number.")
     if not question:
         raise HTTPException(status_code=400, detail="Missing SMS body.")
 
+    if message_sid:
+        cached_reply = get_cached_sms_reply(message_sid)
+        if cached_reply:
+            twiml = MessagingResponse()
+            twiml.message(cached_reply)
+            return PlainTextResponse(str(twiml), media_type="application/xml")
+
     reply_text = build_sms_reply(from_number, question)
+
+    if message_sid:
+        cache_sms_reply(message_sid, _normalize_phone(from_number), question, reply_text)
+
     twiml = MessagingResponse()
     twiml.message(reply_text)
     return PlainTextResponse(str(twiml), media_type="application/xml")
@@ -185,7 +201,15 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if event["type"] == "checkout.session.completed":
+    event_id = str(event.get("id", "")).strip()
+    event_type = str(event.get("type", "")).strip()
+    if event_id and is_event_processed("stripe", event_id):
+        return JSONResponse({"received": True, "duplicate": True})
+
+    if event_type == "checkout.session.completed":
         handle_checkout_completed(event["data"]["object"])
+
+    if event_id:
+        mark_event_processed("stripe", event_id, event_type)
 
     return JSONResponse({"received": True})
