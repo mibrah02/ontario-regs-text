@@ -547,6 +547,7 @@ Alert if:
 
 ### Optional next-stage upgrades
 
+- Railway Postgres cutover once early launch usage justifies the extra monthly cost
 - pgvector instead of local FAISS
 - background worker for ingestion
 - short branded domain for paywall links
