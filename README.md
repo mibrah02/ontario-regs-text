@@ -133,6 +133,29 @@ python -c "from app.rag import build_index; build_index()"
 7. Copy the generated public URL and paste it into Twilio and Stripe.
 8. Update `BASE_URL` in Railway to that exact public URL and redeploy once.
 
+## Migrating to Postgres later
+
+When you are ready to replace the default SQLite state with Railway Postgres:
+
+1. Create a Railway Postgres service and copy its connection URL.
+2. In Railway Variables, set `DATABASE_URL` to that Postgres URL.
+3. Keep `SQLITE_DB_PATH` unchanged for local fallback.
+4. To migrate existing local/SQLite state into Postgres, run:
+
+```bash
+cd "/Users/mohamedi/Documents/ontario-regs-text"
+TARGET_DATABASE_URL="postgresql://..." python3 scripts/migrate_state.py
+```
+
+The migration copies:
+- paid users
+- free usage counters
+- pending clarification state
+- cached inbound SMS replies
+- processed Stripe events
+
+After migration, redeploy Railway so the app starts using Postgres for live state.
+
 ## Local curl test for `/sms`
 
 ```bash
