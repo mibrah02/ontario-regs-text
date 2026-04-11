@@ -30,6 +30,12 @@ class RagClarificationTests(unittest.TestCase):
         self.assertIn("p.44", result.text)
         self.assertIn("65 October 1 to October 4", result.text)
 
+    def test_broad_rabbit_rules_question_requests_specific_topic(self) -> None:
+        result = answer_question_result("what rabbits hunting rules")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "topic")
+        self.assertIn("rabbit daily limit", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

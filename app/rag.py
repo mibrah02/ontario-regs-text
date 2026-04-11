@@ -58,6 +58,10 @@ SPECIES_PATTERNS = {
     "elk": "elk",
     "wolf": "wolf",
     "coyote": "coyote",
+    "rabbit": "rabbit",
+    "hare": "rabbit",
+    "cottontail": "rabbit",
+    "snowshoe": "rabbit",
 }
 
 def _get_embeddings() -> OpenAIEmbeddings:
@@ -383,6 +387,65 @@ def _is_deer_season_question(question: str) -> bool:
     return "deer" in lowered and "season" in lowered
 
 
+BROAD_RULE_TERMS = ("rule", "rules", "regulation", "regulations")
+SPECIFIC_RULE_TERMS = (
+    "season",
+    "limit",
+    "daily",
+    "possession",
+    "wmu",
+    "unit",
+    "tag",
+    "licence",
+    "license",
+    "orange",
+    "calibre",
+    "caliber",
+    "gun",
+    "guns",
+    "bow",
+    "bows",
+    "rifle",
+    "shotgun",
+    "muzzle",
+    "sunday",
+)
+
+
+def _pretty_species_name(label: str) -> str:
+    names = {
+        "deer": "deer",
+        "moose": "moose",
+        "bear": "bear",
+        "turkey": "turkey",
+        "elk": "elk",
+        "wolf": "wolf",
+        "coyote": "coyote",
+        "rabbit": "rabbit",
+    }
+    return names.get(label, label)
+
+
+def _broad_species_rules_clarification(question: str) -> AnswerOutcome | None:
+    lowered = question.lower()
+    if not any(term in lowered for term in BROAD_RULE_TERMS):
+        return None
+    if any(term in lowered for term in SPECIFIC_RULE_TERMS):
+        return None
+
+    species_terms = _extract_species_terms(question)
+    if len(species_terms) != 1:
+        return None
+
+    species = next(iter(species_terms))
+    species_name = _pretty_species_name(species)
+    return _clarification_outcome(
+        f"Ask one specific {species_name} question, for example: {species_name} daily limit, {species_name} possession limit, or {species_name} season in my WMU. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "topic",
+    )
+
+
 def _missing_deer_season_details(question: str) -> list[str]:
     if not _is_deer_season_question(question):
         return []
@@ -476,6 +539,10 @@ def _format_pages(documents: list[Document]) -> str:
 
 
 def answer_question_result(question: str) -> AnswerOutcome:
+    broad_rules = _broad_species_rules_clarification(question)
+    if broad_rules:
+        return broad_rules
+
     missing_details = _missing_deer_season_details(question)
     if missing_details:
         return _build_deer_season_clarification(question, missing_details)
