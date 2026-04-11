@@ -53,6 +53,26 @@ GUIDANCE_TERMS = {
     "what can you do",
     "what do you do",
 }
+ACK_TERMS = {
+    "thanks",
+    "thank you",
+    "thx",
+    "ok",
+    "okay",
+    "cool",
+    "got it",
+    "lol",
+    "haha",
+}
+META_TERMS = {
+    "what do you mean",
+    "which one",
+    "can you clarify",
+    "clarify",
+    "not sure",
+    "i dont know",
+    "i do not know",
+}
 
 
 @asynccontextmanager
@@ -100,6 +120,36 @@ def _is_guidance_message(question: str) -> bool:
     return normalized in GUIDANCE_TERMS
 
 
+def _is_ack_message(question: str) -> bool:
+    normalized = _normalized_message_key(question)
+    return normalized in ACK_TERMS
+
+
+def _is_meta_message(question: str) -> bool:
+    normalized = _normalized_message_key(question)
+    return normalized in META_TERMS
+
+
+def _is_context_free_fragment(question: str) -> bool:
+    normalized = _normalized_message_key(question)
+    if not normalized:
+        return True
+    if normalized in METHOD_REPLY_TERMS:
+        return True
+    if normalized.startswith("wmu ") or bool(re.fullmatch(r"(?:wmu\s*)?\d{1,3}[a-z]?", normalized)):
+        return True
+    return False
+
+
+def _clarification_reminder(pending_state: dict[str, str]) -> str:
+    expected_detail = pending_state.get("expected_detail", "method")
+    if expected_detail == "wmu":
+        return "Still need one detail: reply with the WMU number, for example WMU 65. Informational only. Not legal advice. Verify current regs."
+    if expected_detail == "wmu_and_method":
+        return "Still need two details: reply with the WMU number and method, for example WMU 65 bows only. Informational only. Not legal advice. Verify current regs."
+    return "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
+
+
 def _serialize_pending_state(question: str, expected_detail: str | None) -> str:
     return json.dumps({"question": question, "expected_detail": expected_detail}, ensure_ascii=True)
 
@@ -123,15 +173,14 @@ def _deserialize_pending_state(raw: str | None) -> dict[str, str] | None:
 def _looks_like_pending_follow_up(question: str, pending_state: dict[str, str]) -> bool:
     expected_detail = pending_state.get("expected_detail", "method")
     stripped = question.strip()
-    word_count = len(stripped.split())
 
     if expected_detail == "method":
         return _looks_like_method_reply(stripped)
     if expected_detail == "wmu":
         return bool(WMU_REPLY_RE.search(stripped))
     if expected_detail == "wmu_and_method":
-        return bool(WMU_REPLY_RE.search(stripped)) or _looks_like_method_reply(stripped) or word_count <= 8
-    return word_count <= 8
+        return bool(WMU_REPLY_RE.search(stripped)) or _looks_like_method_reply(stripped)
+    return False
 
 
 def _question_with_clarification(from_number: str, question: str) -> str:
@@ -143,6 +192,19 @@ def _question_with_clarification(from_number: str, question: str) -> str:
     return question
 
 
+def _pending_state(from_number: str) -> dict[str, str] | None:
+    raw_pending = get_pending_clarification(_normalize_phone(from_number))
+    return _deserialize_pending_state(raw_pending)
+
+
+def _should_repeat_clarification(question: str, pending_state: dict[str, str] | None) -> bool:
+    if not pending_state:
+        return False
+    if _looks_like_pending_follow_up(question, pending_state):
+        return False
+    return _is_ack_message(question) or _is_guidance_message(question) or _is_meta_message(question) or _is_context_free_fragment(question)
+
+
 def _track_clarification(from_number: str, outcome: AnswerOutcome) -> None:
     key = _normalize_phone(from_number)
     if outcome.kind == "clarify" and outcome.pending_question:
@@ -152,6 +214,10 @@ def _track_clarification(from_number: str, outcome: AnswerOutcome) -> None:
 
 
 def _safe_answer(from_number: str, question: str) -> str:
+    pending_state = _pending_state(from_number)
+    if _should_repeat_clarification(question, pending_state):
+        return _clarification_reminder(pending_state)
+
     effective_question = _question_with_clarification(from_number, question)
     try:
         outcome = answer_question_result(effective_question)
@@ -162,7 +228,11 @@ def _safe_answer(from_number: str, question: str) -> str:
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
-    if _is_guidance_message(question):
+    pending_state = _pending_state(from_number)
+    if (_is_guidance_message(question) or _is_ack_message(question) or _is_meta_message(question)) and not pending_state:
+        return GUIDANCE_RESPONSE
+
+    if _is_context_free_fragment(question) and not pending_state:
         return GUIDANCE_RESPONSE
 
     if question.startswith(PAYWALL_TEST_PREFIX):
