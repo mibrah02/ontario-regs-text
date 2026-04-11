@@ -30,11 +30,29 @@ load_dotenv()
 
 FREE_QUESTION_LIMIT = 3
 NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Info only. Not legal advice. Verify current regs."
+GUIDANCE_RESPONSE = (
+    "Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. "
+    "I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs."
+)
 TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
 PAYWALL_TEST_PREFIX = "PAYWALL "
 SEEDED_PAID_NUMBERS = {item.strip() for item in os.getenv("SEEDED_PAID_NUMBERS", "").split(",") if item.strip()}
 METHOD_REPLY_TERMS = ("bow", "bows only", "rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")
-WMU_REPLY_RE = re.compile(r"(?:wmu\s*)?\d{1,3}[a-z]?", re.IGNORECASE)
+WMU_REPLY_RE = re.compile(r"\b(?:wmu\s*)?\d{1,3}[a-z]?\b", re.IGNORECASE)
+GUIDANCE_TERMS = {
+    "hi",
+    "hello",
+    "hey",
+    "help",
+    "start",
+    "menu",
+    "info",
+    "usage",
+    "how do i use this",
+    "how to use this",
+    "what can you do",
+    "what do you do",
+}
 
 
 @asynccontextmanager
@@ -71,6 +89,15 @@ def _payment_entry_url(phone: str) -> str:
 def _looks_like_method_reply(question: str) -> bool:
     lowered = question.lower().strip()
     return any(term in lowered for term in METHOD_REPLY_TERMS)
+
+
+def _normalized_message_key(question: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", question.lower()).strip()
+
+
+def _is_guidance_message(question: str) -> bool:
+    normalized = _normalized_message_key(question)
+    return normalized in GUIDANCE_TERMS
 
 
 def _serialize_pending_state(question: str, expected_detail: str | None) -> str:
@@ -135,6 +162,9 @@ def _safe_answer(from_number: str, question: str) -> str:
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
+    if _is_guidance_message(question):
+        return GUIDANCE_RESPONSE
+
     if question.startswith(PAYWALL_TEST_PREFIX):
         try:
             get_checkout_url(from_number)
