@@ -74,6 +74,7 @@ uvicorn app.main:app --reload
 
 ```bash
 python tests/simulate_sms.py
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
 ## Twilio setup you must do
