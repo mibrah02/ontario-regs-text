@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -361,6 +362,14 @@ def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
 
     return sorted(documents, key=sort_key, reverse=True)
 
+@dataclass
+class AnswerOutcome:
+    text: str
+    kind: str
+    pending_question: str | None = None
+    expected_detail: str | None = None
+
+
 METHOD_TERMS = ("bow", "bows", "rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")
 
 
@@ -369,14 +378,53 @@ def _question_specifies_method(question: str) -> bool:
     return any(term in lowered for term in METHOD_TERMS)
 
 
-
-
-def _needs_season_clarification(question: str) -> bool:
+def _is_deer_season_question(question: str) -> bool:
     lowered = question.lower()
-    has_wmu = bool(re.search(r"\bwmu\s*\d{1,3}[a-z]?\b", lowered)) or " wildlife management unit " in f" {lowered} "
-    asks_season = "season" in lowered
-    mentions_deer = "deer" in lowered
-    return has_wmu and asks_season and mentions_deer and not _question_specifies_method(question)
+    return "deer" in lowered and "season" in lowered
+
+
+def _missing_deer_season_details(question: str) -> list[str]:
+    if not _is_deer_season_question(question):
+        return []
+
+    missing: list[str] = []
+    if not _extract_wmu_terms(question):
+        missing.append("wmu")
+    if not _question_specifies_method(question):
+        missing.append("method")
+    return missing
+
+
+def _clarification_outcome(text: str, question: str, expected_detail: str) -> AnswerOutcome:
+    return AnswerOutcome(
+        text=text,
+        kind="clarify",
+        pending_question=question,
+        expected_detail=expected_detail,
+    )
+
+
+def _build_deer_season_clarification(question: str, missing_details: list[str]) -> AnswerOutcome:
+    if missing_details == ["wmu", "method"] or set(missing_details) == {"wmu", "method"}:
+        return _clarification_outcome(
+            "Need two details: reply with the WMU number and method, for example: WMU 65 bows only. Informational only. Not legal advice. Verify current regs.",
+            question,
+            "wmu_and_method",
+        )
+
+    if missing_details == ["wmu"]:
+        return _clarification_outcome(
+            "Need one more detail: reply with the WMU number, for example WMU 65. Informational only. Not legal advice. Verify current regs.",
+            question,
+            "wmu",
+        )
+
+    return _clarification_outcome(
+        "WMU deer season has multiple entries. Reply with one: bows only, or guns. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "method",
+    )
+
 
 def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
     if _question_specifies_method(question):
@@ -391,8 +439,7 @@ def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
 
 
 
-
-def _ambiguity_clarification(documents: list[Document]) -> str:
+def _ambiguity_clarification(question: str, documents: list[Document]) -> AnswerOutcome:
     contexts = [
         document.metadata.get("table_context", "")
         for document in documents
@@ -400,16 +447,18 @@ def _ambiguity_clarification(documents: list[Document]) -> str:
     ]
     joined = " ".join(contexts).lower()
 
-    options: list[str] = []
-    if "bows only" in joined:
-        options.append("bows only")
-    if "rifles, shotguns, muzzle-loading guns and bows" in joined:
-        options.append("rifles, shotguns, muzzle-loading guns and bows")
+    if "bows only" in joined and "rifles, shotguns, muzzle-loading guns and bows" in joined:
+        return _clarification_outcome(
+            "Your question matches multiple entries in the 2026 Summary. Reply with one: bows only, or guns. Informational only. Not legal advice. Verify current regs.",
+            question,
+            "method",
+        )
 
-    if not options:
-        return "Your question matches multiple entries in the 2026 Summary. Specify the hunting method or season type. Informational only. Not legal advice. Verify current regs."
-
-    return f"Your question matches multiple entries in the 2026 Summary. Specify one of: {', '.join(options)}. Informational only. Not legal advice. Verify current regs."
+    return _clarification_outcome(
+        "Your question matches multiple entries in the 2026 Summary. Please ask again with the hunting method or season type. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "method",
+    )
 
 def _format_pages(documents: list[Document]) -> str:
     formatted_pages: list[dict[str, Any]] = []
@@ -426,26 +475,33 @@ def _format_pages(documents: list[Document]) -> str:
     return json.dumps(formatted_pages, ensure_ascii=True)
 
 
-def answer_question(question: str) -> str:
-    if _needs_season_clarification(question):
-        return "Your question matches multiple deer season entries in the 2026 Summary. Specify a method, for example bows only or rifles/shotguns/muzzle-loading guns and bows. Informational only. Not legal advice. Verify current regs."
+def answer_question_result(question: str) -> AnswerOutcome:
+    missing_details = _missing_deer_season_details(question)
+    if missing_details:
+        return _build_deer_season_clarification(question, missing_details)
 
     vectorstore = _load_vectorstore()
     direct_matches = _direct_structured_match(vectorstore, question)
     if direct_matches:
         if len(direct_matches) == 1:
-            return _format_exact_quote(direct_matches[0])
+            return AnswerOutcome(text=_format_exact_quote(direct_matches[0]), kind="answer")
         results = direct_matches
     else:
         retrieval_query = _rewrite_search_query(question)
         results = vectorstore.similarity_search(retrieval_query, k=8)
         results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
     if _results_are_ambiguous(question, results):
-        return _ambiguity_clarification(results)
+        return _ambiguity_clarification(question, results)
 
     prompt = SYSTEM_PROMPT.format(
         question=question,
         pages=_format_pages(results),
     )
     response = _get_chat_model().invoke(prompt)
-    return _normalize_model_output(response.content)
+    normalized = _normalize_model_output(response.content)
+    kind = "not_found" if normalized.startswith("Not found in 2026 Summary.") else "answer"
+    return AnswerOutcome(text=normalized, kind=kind)
+
+
+def answer_question(question: str) -> str:
+    return answer_question_result(question).text

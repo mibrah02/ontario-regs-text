@@ -10,14 +10,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app.main as main_module
+from app.rag import AnswerOutcome
 
 
 def main() -> None:
     # Keep the test local and deterministic by replacing networked services.
-    main_module.answer_question = lambda question: (
-        "2026 Ontario Hunting Regulations Summary, p.12: "
-        '"Sample exact sentence from PDF." ontario.ca/hunting\n'
-        "Informational only. Not legal advice. Verify current regs."
+    main_module.answer_question_result = lambda question: AnswerOutcome(
+        text=(
+            "2026 Ontario Hunting Regulations Summary, p.12: "
+            '"Sample exact sentence from PDF." ontario.ca/hunting\n'
+            "Informational only. Not legal advice. Verify current regs."
+        ),
+        kind="answer",
     )
     main_module.get_checkout_url = lambda phone: (
         f"https://checkout.stripe.com/pay/demo?client_reference_id={phone}"
