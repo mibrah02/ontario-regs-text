@@ -10,6 +10,40 @@ if str(ROOT) not in sys.path:
 
 import app.main as main_module
 from app.db import clear_pending_clarification, get_pending_clarification
+from app.rag import IntakeOutcome
+
+
+def fake_interpret(question: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
+    text = question.strip().lower()
+    pending_state = pending_state or {}
+    pending_question = pending_state.get("question", "")
+    expected_detail = pending_state.get("expected_detail", "")
+
+    if text in {"hello", "help", "hi", "hey"}:
+        return IntakeOutcome(action="guide", reply_text=main_module.GUIDANCE_RESPONSE)
+
+    if pending_question:
+        if text in {"thanks", "what do you mean"}:
+            detail = expected_detail or "method"
+            if detail == "wmu_and_method":
+                reply = "Still need two details: reply with the WMU number and method, for example WMU 65 bows only. Informational only. Not legal advice. Verify current regs."
+            elif detail == "method":
+                reply = "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
+            else:
+                reply = "Please ask again with one specific topic, for example: daily limit, possession limit, season, tag, or hunter orange. Informational only. Not legal advice. Verify current regs."
+            return IntakeOutcome(
+                action="clarify",
+                reply_text=reply,
+                pending_question=pending_question,
+                expected_detail=detail,
+            )
+        if text == "bows only":
+            return IntakeOutcome(action="search", normalized_question=f"{pending_question} bows only")
+
+    if text == "guns":
+        return IntakeOutcome(action="guide", reply_text=main_module.GUIDANCE_RESPONSE)
+
+    return IntakeOutcome(action="search", normalized_question=question)
 
 
 class SmsGuidanceTests(unittest.TestCase):
@@ -17,8 +51,11 @@ class SmsGuidanceTests(unittest.TestCase):
         self.phone = main_module.TEST_BYPASS_PHONE
         self.key = main_module._normalize_phone(self.phone)
         clear_pending_clarification(self.key)
+        self.original_interpret = main_module.interpret_incoming_message
+        main_module.interpret_incoming_message = fake_interpret
 
     def tearDown(self) -> None:
+        main_module.interpret_incoming_message = self.original_interpret
         clear_pending_clarification(self.key)
 
     def test_hello_returns_guidance_without_counting_usage(self) -> None:

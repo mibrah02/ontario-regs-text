@@ -19,6 +19,7 @@ load_dotenv()
 PDF_URL = "https://www.ontario.ca/document/ontario-hunting-regulations-summary"
 DEFAULT_PDF_PATH = Path(os.getenv("SOURCE_PDF_PATH", "data/2026-ontario-hunting-regulations-summary.pdf"))
 INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", "data"))
+INTAKE_MODEL = os.getenv("INTAKE_MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = """You are a search tool for the 2026 Ontario Hunting Regulations Summary only.
 Never summarize, never interpret, never use outside knowledge.
 User question: {question}
@@ -70,6 +71,10 @@ def _get_embeddings() -> OpenAIEmbeddings:
 
 def _get_chat_model() -> ChatOpenAI:
     return ChatOpenAI(model="gpt-4o", temperature=0)
+
+
+def _get_intake_model() -> ChatOpenAI:
+    return ChatOpenAI(model=INTAKE_MODEL, temperature=0)
 
 
 def _get_rewrite_model() -> ChatOpenAI:
@@ -365,6 +370,193 @@ def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
         return (species_bonus, overlap, table_bonus)
 
     return sorted(documents, key=sort_key, reverse=True)
+
+INTAKE_GUIDANCE_RESPONSE = (
+    "Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. "
+    "I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs."
+)
+
+
+INTAKE_PROMPT = """You are the intake layer for Ontario Regs Text, an SMS bot that answers Ontario hunting regulation questions.
+Your job is only to understand the user's message and choose the next step.
+You do not answer legal or hunting questions yourself.
+
+Return strict JSON only with these keys:
+action: one of "guide", "clarify", or "search"
+normalized_question: short plain-language query for downstream retrieval, or ""
+reply_text: SMS text to send if action is guide or clarify, or ""
+pending_question: canonical question to store if action is clarify, or ""
+expected_detail: short label like "topic", "method", "wmu", "wmu_and_method", or "detail", or ""
+
+Rules:
+- Use action=search when the user asked a specific hunting-regs question, even if phrasing is messy.
+- Use action=guide for greetings, chit-chat, or messages with no usable hunting-regs question.
+- Use action=clarify when the message is hunting-related but still missing an important detail.
+- If pending context exists and the new message clearly starts a new question, ignore the pending context.
+- If pending context exists and the new message fills the missing detail, combine it and use action=search.
+- If pending context exists and the new message is meta, confusion, or acknowledgement, use action=clarify and repeat the missing detail briefly.
+- Keep reply_text short and natural for SMS.
+- Never answer from memory and never quote regulations yourself.
+
+Examples:
+1. pending: none | message: "hello"
+{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
+2. pending: {"question":"when is deer season","expected_detail":"wmu_and_method"} | message: "WMU 65"
+{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs.","pending_question":"when is deer season in WMU 65","expected_detail":"method"}
+3. pending: {"question":"when is deer season in WMU 65","expected_detail":"method"} | message: "bows only"
+{"action":"search","normalized_question":"when is deer season in WMU 65 bows only","reply_text":"","pending_question":"","expected_detail":""}
+4. pending: none | message: "what rabbits hunting rules"
+{"action":"clarify","normalized_question":"","reply_text":"Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in my WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
+5. pending: none | message: "duck daily limit"
+{"action":"search","normalized_question":"duck daily limit","reply_text":"","pending_question":"","expected_detail":""}
+6. pending: none | message: "guns"
+{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
+
+Pending question: {pending_question}
+Expected detail: {expected_detail}
+Incoming message: {message}
+"""
+
+
+@dataclass
+class IntakeOutcome:
+    action: str
+    normalized_question: str = ""
+    reply_text: str = ""
+    pending_question: str | None = None
+    expected_detail: str | None = None
+
+
+def _normalize_intake_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+
+
+def _clarification_reminder_text(expected_detail: str | None) -> str:
+    if expected_detail == "wmu":
+        return "Still need one detail: reply with the WMU number, for example WMU 65. Informational only. Not legal advice. Verify current regs."
+    if expected_detail == "wmu_and_method":
+        return "Still need two details: reply with the WMU number and method, for example WMU 65 bows only. Informational only. Not legal advice. Verify current regs."
+    if expected_detail == "topic":
+        return "Please ask again with one specific topic, for example: daily limit, possession limit, season, tag, or hunter orange. Informational only. Not legal advice. Verify current regs."
+    return "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
+
+
+def _looks_like_follow_up_fragment(message: str, expected_detail: str | None) -> bool:
+    lowered = message.lower().strip()
+    if not lowered:
+        return False
+    if expected_detail in {"method", "wmu_and_method"} and _question_specifies_method(lowered):
+        return True
+    if expected_detail in {"wmu", "wmu_and_method"} and _extract_wmu_terms(lowered):
+        return True
+    if expected_detail == "topic":
+        return len(re.findall(r"\w+", lowered)) <= 6
+    return False
+
+
+def _looks_like_new_question(message: str, pending_question: str, expected_detail: str | None) -> bool:
+    if not pending_question:
+        return False
+    if _looks_like_follow_up_fragment(message, expected_detail):
+        return False
+
+    lowered = message.lower().strip()
+    word_count = len(re.findall(r"\w+", lowered))
+    if word_count < 3:
+        return False
+
+    pending_species = _infer_species(pending_question)
+    message_species = _infer_species(message)
+    if message_species and message_species != pending_species:
+        return True
+
+    return lowered.startswith(("what", "when", "where", "which", "who", "can", "do", "does", "is", "are", "how", "tell me"))
+
+
+def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
+    normalized = _normalize_intake_key(message)
+    pending_question = (pending_state or {}).get("question", "").strip()
+    expected_detail = (pending_state or {}).get("expected_detail", "").strip() or None
+
+    if pending_question:
+        if normalized in {"thanks", "thank you", "thx", "ok", "okay", "cool", "got it", "lol", "haha", "what do you mean", "which one", "can you clarify", "clarify", "not sure", "i dont know", "i do not know"}:
+            return IntakeOutcome(
+                action="clarify",
+                reply_text=_clarification_reminder_text(expected_detail),
+                pending_question=pending_question,
+                expected_detail=expected_detail,
+            )
+        if _looks_like_follow_up_fragment(message, expected_detail):
+            combined = f"{pending_question} {message.strip()}".strip()
+            return IntakeOutcome(action="search", normalized_question=combined)
+
+    if normalized in {"hi", "hello", "hey", "help", "start", "menu", "info", "usage", "how do i use this", "how to use this", "what can you do", "what do you do"}:
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    if normalized in {"thanks", "thank you", "thx", "ok", "okay", "cool", "got it", "lol", "haha"}:
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    if not normalized:
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    if len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized))):
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    return IntakeOutcome(action="search", normalized_question=message.strip())
+
+
+def _strip_json_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
+    pending_question = (pending_state or {}).get("question", "").strip()
+    expected_detail = (pending_state or {}).get("expected_detail", "").strip() or ""
+    prompt = (
+        INTAKE_PROMPT.replace("{pending_question}", pending_question or "none")
+        .replace("{expected_detail}", expected_detail or "none")
+        .replace("{message}", message.strip())
+    )
+    try:
+        response = _get_intake_model().invoke(prompt)
+        payload = json.loads(_strip_json_fence(str(response.content)))
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"guide", "clarify", "search"}:
+            raise ValueError(f"Unexpected intake action: {action!r}")
+        normalized_question = _normalize_inline(str(payload.get("normalized_question", "")))
+        reply_text = _normalize_inline(str(payload.get("reply_text", "")))
+        stored_question = _normalize_inline(str(payload.get("pending_question", ""))) or None
+        stored_detail = _normalize_inline(str(payload.get("expected_detail", ""))) or None
+
+        follow_up_like = bool(pending_question) and _looks_like_follow_up_fragment(message, expected_detail or None)
+        new_question_like = bool(pending_question) and _looks_like_new_question(message, pending_question, expected_detail or None)
+
+        if action == "search" and not normalized_question:
+            normalized_question = message.strip()
+        if action in {"guide", "clarify"} and not reply_text:
+            raise ValueError("Missing reply_text for non-search action")
+
+        if action == "clarify" and new_question_like and not follow_up_like:
+            if not stored_question or stored_question == pending_question:
+                species = _infer_species(message)
+                stored_question = species or message.strip()
+        if action == "search" and new_question_like and not follow_up_like and pending_question and normalized_question == pending_question:
+            normalized_question = message.strip()
+
+        return IntakeOutcome(
+            action=action,
+            normalized_question=normalized_question,
+            reply_text=reply_text,
+            pending_question=stored_question,
+            expected_detail=stored_detail,
+        )
+    except Exception:
+        return _fallback_interpret_incoming_message(message, pending_state)
+
 
 @dataclass
 class AnswerOutcome:

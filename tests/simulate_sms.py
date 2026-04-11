@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app.main as main_module
-from app.rag import AnswerOutcome
+from app.rag import AnswerOutcome, IntakeOutcome
 
 
 def main() -> None:
@@ -22,6 +22,10 @@ def main() -> None:
             "Informational only. Not legal advice. Verify current regs."
         ),
         kind="answer",
+    )
+    main_module.interpret_incoming_message = lambda question, pending_state=None: IntakeOutcome(
+        action="search",
+        normalized_question=question,
     )
     main_module.get_checkout_url = lambda phone: (
         f"https://checkout.stripe.com/pay/demo?client_reference_id={phone}"

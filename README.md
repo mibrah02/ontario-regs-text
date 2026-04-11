@@ -6,6 +6,7 @@ Production-ready SMS bot for Ontario hunting regulation questions. The bot only 
 
 - FastAPI app with `/sms`, `/stripe`, and `/health`
 - PDF-to-FAISS indexing pipeline using LangChain + OpenAI embeddings
+- LLM-based SMS intake layer that interprets greetings, vague questions, and follow-ups before retrieval
 - SQLAlchemy-backed app state with SQLite by default and Railway/Postgres-ready configuration
 - Idempotent Twilio SMS caching and Stripe webhook processing
 - Stripe Checkout subscription flow for `$49 CAD / year`
@@ -124,6 +125,7 @@ https://<your-domain>/stripe
    - `DATABASE_URL=sqlite+pysqlite:///data/app.db`
    - `SQLITE_DB_PATH=data/app.db`
    - `CLARIFICATION_TTL_MINUTES=30`
+   - `INTAKE_MODEL=gpt-4o-mini`
 5. In Railway shell or predeploy command, build the index once:
 
 ```bash
@@ -168,6 +170,7 @@ curl -X POST http://127.0.0.1:8000/sms \
 ## Notes
 
 - Free usage, clarification state, inbound SMS caching, and processed Stripe events are stored in the database.
+- Incoming SMS first go through a small intent-model call so the bot can interpret natural messages before quote retrieval.
 - The app accepts Railway-style `postgres://` or `postgresql://` values and normalizes them to SQLAlchemy `postgresql+psycopg://`.
 - Duplicate Twilio deliveries reuse the cached reply instead of recomputing retrieval or incrementing usage.
 - Duplicate Stripe webhook events are ignored safely after the first successful processing.
