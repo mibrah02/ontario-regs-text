@@ -5,6 +5,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from time import monotonic
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,9 @@ ANSWER_TIMEOUT_SECONDS = float(os.getenv("ANSWER_TIMEOUT_SECONDS", "5.5"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
 MODEL_CALL_WORKERS = max(2, int(os.getenv("MODEL_CALL_WORKERS", "4")))
 MODEL_CALL_POOL = ThreadPoolExecutor(max_workers=MODEL_CALL_WORKERS)
+ANSWER_CACHE_TTL_SECONDS = float(os.getenv("ANSWER_CACHE_TTL_SECONDS", "21600"))
+ANSWER_CACHE_MAX_ITEMS = max(32, int(os.getenv("ANSWER_CACHE_MAX_ITEMS", "512")))
+ANSWER_CACHE: dict[str, tuple[float, "AnswerOutcome"]] = {}
 SYSTEM_PROMPT = """You are a search tool for the 2026 Ontario Hunting Regulations Summary only.
 Never summarize, never interpret, never use outside knowledge.
 User question: {question}
@@ -138,6 +142,61 @@ def _normalize_model_output(text: str) -> str:
     if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
         text = text[1:-1].strip()
     return text
+
+
+def _normalize_question_cache_key(question: str) -> str:
+    lowered = question.lower().strip()
+    lowered = re.sub(r"[^a-z0-9 ]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def _prune_answer_cache(now: float) -> None:
+    expired = [key for key, (expires_at, _) in ANSWER_CACHE.items() if expires_at <= now]
+    for key in expired:
+        ANSWER_CACHE.pop(key, None)
+    if len(ANSWER_CACHE) <= ANSWER_CACHE_MAX_ITEMS:
+        return
+    overflow = len(ANSWER_CACHE) - ANSWER_CACHE_MAX_ITEMS
+    for key in sorted(ANSWER_CACHE, key=lambda item: ANSWER_CACHE[item][0])[:overflow]:
+        ANSWER_CACHE.pop(key, None)
+
+
+def _get_cached_answer(question: str):
+    key = _normalize_question_cache_key(question)
+    if not key:
+        return None
+    now = monotonic()
+    cached = ANSWER_CACHE.get(key)
+    if not cached:
+        return None
+    expires_at, outcome = cached
+    if expires_at <= now:
+        ANSWER_CACHE.pop(key, None)
+        return None
+    return AnswerOutcome(
+        text=outcome.text,
+        kind=outcome.kind,
+        pending_question=outcome.pending_question,
+        expected_detail=outcome.expected_detail,
+    )
+
+
+def _set_cached_answer(question: str, outcome: "AnswerOutcome") -> None:
+    key = _normalize_question_cache_key(question)
+    if not key:
+        return
+    now = monotonic()
+    ANSWER_CACHE[key] = (
+        now + ANSWER_CACHE_TTL_SECONDS,
+        AnswerOutcome(
+            text=outcome.text,
+            kind=outcome.kind,
+            pending_question=outcome.pending_question,
+            expected_detail=outcome.expected_detail,
+        ),
+    )
+    _prune_answer_cache(now)
 
 
 def _compress_repeated_table_row(text: str) -> str:
@@ -860,30 +919,42 @@ def _format_pages(documents: list[Document]) -> str:
 
 
 def answer_question_result(question: str) -> AnswerOutcome:
+    cached = _get_cached_answer(question)
+    if cached is not None:
+        return cached
+
     broad_species = _broad_species_question_clarification(question)
     if broad_species:
+        _set_cached_answer(question, broad_species)
         return broad_species
 
     broad_general = _broad_general_question_clarification(question)
     if broad_general:
+        _set_cached_answer(question, broad_general)
         return broad_general
 
     missing_details = _missing_deer_season_details(question)
     if missing_details:
-        return _build_deer_season_clarification(question, missing_details)
+        outcome = _build_deer_season_clarification(question, missing_details)
+        _set_cached_answer(question, outcome)
+        return outcome
 
     vectorstore = _load_vectorstore()
     direct_matches = _direct_structured_match(vectorstore, question)
     if direct_matches:
         if len(direct_matches) == 1:
-            return AnswerOutcome(text=_format_exact_quote(direct_matches[0]), kind="answer")
+            outcome = AnswerOutcome(text=_format_exact_quote(direct_matches[0]), kind="answer")
+            _set_cached_answer(question, outcome)
+            return outcome
         results = direct_matches
     else:
         retrieval_query = _rewrite_search_query(question)
         results = vectorstore.similarity_search(retrieval_query, k=8)
         results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
     if _results_are_ambiguous(question, results):
-        return _ambiguity_clarification(question, results)
+        outcome = _ambiguity_clarification(question, results)
+        _set_cached_answer(question, outcome)
+        return outcome
 
     prompt = SYSTEM_PROMPT.format(
         question=question,
@@ -894,10 +965,14 @@ def answer_question_result(question: str) -> AnswerOutcome:
         ANSWER_TIMEOUT_SECONDS,
     )
     if response is None:
-        return AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
+        outcome = AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
+        _set_cached_answer(question, outcome)
+        return outcome
     normalized = _normalize_model_output(response.content)
     kind = "not_found" if normalized.startswith("Not found in 2026 Summary.") else "answer"
-    return AnswerOutcome(text=normalized, kind=kind)
+    outcome = AnswerOutcome(text=normalized, kind=kind)
+    _set_cached_answer(question, outcome)
+    return outcome
 
 
 def answer_question(question: str) -> str:

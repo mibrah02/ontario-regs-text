@@ -100,6 +100,41 @@ class LlmResilienceTests(unittest.TestCase):
         self.assertEqual(result.action, "search")
         self.assertEqual(result.normalized_question, "what are daily limits for rabbits")
 
+    def test_answer_cache_skips_repeat_model_call(self) -> None:
+        original_cache = dict(rag_module.ANSWER_CACHE)
+        original_get_chat_model = rag_module._get_chat_model
+        original_load_vectorstore = rag_module._load_vectorstore
+        original_direct_match = rag_module._direct_structured_match
+        original_rewrite = rag_module._rewrite_search_query
+        try:
+            calls = {"count": 0}
+
+            class _CountingModel:
+                def invoke(self, prompt: str):
+                    calls["count"] += 1
+                    return _SlowResponse(
+                        '2026 Ontario Hunting Regulations Summary, p.12: "Cached sample." ontario.ca/hunting\nInformational only. Not legal advice. Verify current regs.'
+                    )
+
+            rag_module.ANSWER_CACHE.clear()
+            rag_module._get_chat_model = lambda: _CountingModel()
+            rag_module._load_vectorstore = lambda: _FakeVectorStore()
+            rag_module._direct_structured_match = lambda vectorstore, question: []
+            rag_module._rewrite_search_query = lambda question: question
+
+            first = rag_module.answer_question_result("what calibre is allowed for deer")
+            second = rag_module.answer_question_result("what calibre is allowed for deer")
+        finally:
+            rag_module.ANSWER_CACHE.clear()
+            rag_module.ANSWER_CACHE.update(original_cache)
+            rag_module._get_chat_model = original_get_chat_model
+            rag_module._load_vectorstore = original_load_vectorstore
+            rag_module._direct_structured_match = original_direct_match
+            rag_module._rewrite_search_query = original_rewrite
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first.text, second.text)
+
     def test_build_sms_reply_survives_intake_exception(self) -> None:
         original_interpret = main_module.interpret_incoming_message
         original_answer = main_module.answer_question_result
