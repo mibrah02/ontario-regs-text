@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import os
 import re
@@ -19,7 +20,19 @@ load_dotenv()
 PDF_URL = "https://www.ontario.ca/document/ontario-hunting-regulations-summary"
 DEFAULT_PDF_PATH = Path(os.getenv("SOURCE_PDF_PATH", "data/2026-ontario-hunting-regulations-summary.pdf"))
 INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", "data"))
+NOT_FOUND_RESPONSE = (
+    "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. "
+    "Informational only. Not legal advice. Verify current regs."
+)
 INTAKE_MODEL = os.getenv("INTAKE_MODEL", "gpt-4o-mini")
+REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gpt-4o-mini")
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "gpt-4o")
+INTAKE_TIMEOUT_SECONDS = float(os.getenv("INTAKE_TIMEOUT_SECONDS", "3.5"))
+REWRITE_TIMEOUT_SECONDS = float(os.getenv("REWRITE_TIMEOUT_SECONDS", "2.5"))
+ANSWER_TIMEOUT_SECONDS = float(os.getenv("ANSWER_TIMEOUT_SECONDS", "5.5"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+MODEL_CALL_WORKERS = max(2, int(os.getenv("MODEL_CALL_WORKERS", "4")))
+MODEL_CALL_POOL = ThreadPoolExecutor(max_workers=MODEL_CALL_WORKERS)
 SYSTEM_PROMPT = """You are a search tool for the 2026 Ontario Hunting Regulations Summary only.
 Never summarize, never interpret, never use outside knowledge.
 User question: {question}
@@ -70,15 +83,39 @@ def _get_embeddings() -> OpenAIEmbeddings:
 
 
 def _get_chat_model() -> ChatOpenAI:
-    return ChatOpenAI(model="gpt-4o", temperature=0)
+    return ChatOpenAI(
+        model=ANSWER_MODEL,
+        temperature=0,
+        timeout=ANSWER_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
 
 
 def _get_intake_model() -> ChatOpenAI:
-    return ChatOpenAI(model=INTAKE_MODEL, temperature=0)
+    return ChatOpenAI(
+        model=INTAKE_MODEL,
+        temperature=0,
+        timeout=INTAKE_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
 
 
 def _get_rewrite_model() -> ChatOpenAI:
-    return ChatOpenAI(model="gpt-4o", temperature=0)
+    return ChatOpenAI(
+        model=REWRITE_MODEL,
+        temperature=0,
+        timeout=REWRITE_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+
+
+def _invoke_model_call(callable_obj, timeout_seconds: float):
+    future = MODEL_CALL_POOL.submit(callable_obj)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        future.cancel()
+        return None
 
 
 def _normalize_page_text(text: str) -> str:
@@ -347,7 +384,12 @@ def _load_vectorstore() -> FAISS:
 
 def _rewrite_search_query(question: str) -> str:
     try:
-        response = _get_rewrite_model().invoke(SEARCH_REWRITE_PROMPT.format(question=question))
+        response = _invoke_model_call(
+            lambda: _get_rewrite_model().invoke(SEARCH_REWRITE_PROMPT.format(question=question)),
+            REWRITE_TIMEOUT_SECONDS,
+        )
+        if response is None:
+            return question
         rewritten = _normalize_inline(response.content)
         return rewritten or question
     except Exception:
@@ -429,6 +471,42 @@ class IntakeOutcome:
 
 def _normalize_intake_key(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+
+
+INTAKE_SPECIFIC_TOPIC_TERMS = (
+    "season",
+    "limit",
+    "daily",
+    "possession",
+    "wmu",
+    "unit",
+    "tag",
+    "licence",
+    "license",
+    "orange",
+    "calibre",
+    "caliber",
+    "gun",
+    "guns",
+    "bow",
+    "bows",
+    "rifle",
+    "shotgun",
+    "muzzle",
+    "sunday",
+    "date",
+    "dates",
+    "resident",
+    "nonresident",
+    "non-resident",
+    "calf",
+    "antlerless",
+)
+
+
+def _message_has_specific_topic_hint(message: str) -> bool:
+    lowered = message.lower()
+    return any(term in lowered for term in INTAKE_SPECIFIC_TOPIC_TERMS)
 
 
 def _clarification_reminder_text(expected_detail: str | None) -> str:
@@ -522,7 +600,12 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
         .replace("{message}", message.strip())
     )
     try:
-        response = _get_intake_model().invoke(prompt)
+        response = _invoke_model_call(
+            lambda: _get_intake_model().invoke(prompt),
+            INTAKE_TIMEOUT_SECONDS,
+        )
+        if response is None:
+            return _fallback_interpret_incoming_message(message, pending_state)
         payload = json.loads(_strip_json_fence(str(response.content)))
         action = str(payload.get("action", "")).strip().lower()
         if action not in {"guide", "clarify", "search"}:
@@ -539,6 +622,13 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
             normalized_question = message.strip()
         if action in {"guide", "clarify"} and not reply_text:
             raise ValueError("Missing reply_text for non-search action")
+
+        if action == "clarify" and stored_detail == "topic" and _message_has_specific_topic_hint(message):
+            action = "search"
+            normalized_question = message.strip()
+            reply_text = ""
+            stored_question = None
+            stored_detail = None
 
         if action == "clarify" and new_question_like and not follow_up_like:
             if not stored_question or stored_question == pending_question:
@@ -799,7 +889,12 @@ def answer_question_result(question: str) -> AnswerOutcome:
         question=question,
         pages=_format_pages(results),
     )
-    response = _get_chat_model().invoke(prompt)
+    response = _invoke_model_call(
+        lambda: _get_chat_model().invoke(prompt),
+        ANSWER_TIMEOUT_SECONDS,
+    )
+    if response is None:
+        return AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
     normalized = _normalize_model_output(response.content)
     kind = "not_found" if normalized.startswith("Not found in 2026 Summary.") else "answer"
     return AnswerOutcome(text=normalized, kind=kind)

@@ -110,6 +110,13 @@ def _track_intake(from_number: str, outcome: IntakeOutcome) -> None:
         clear_pending_clarification(key)
 
 
+def _safe_intake(question: str, pending_state: dict[str, str] | None) -> IntakeOutcome:
+    try:
+        return interpret_incoming_message(question, pending_state)
+    except Exception:
+        return IntakeOutcome(action="search", normalized_question=question)
+
+
 def _safe_answer(from_number: str, question: str) -> str:
     try:
         outcome = answer_question_result(question)
@@ -128,7 +135,7 @@ def build_sms_reply(from_number: str, question: str) -> str:
             return "Free limit reached. Payment link unavailable. Try again later."
 
     pending_state = _pending_state(from_number)
-    intake = interpret_incoming_message(question, pending_state)
+    intake = _safe_intake(question, pending_state)
 
     if intake.action in {"guide", "clarify"}:
         _track_intake(from_number, intake)
@@ -206,16 +213,25 @@ async def sms_webhook(request: Request) -> PlainTextResponse:
         raise HTTPException(status_code=400, detail="Missing SMS body.")
 
     if message_sid:
-        cached_reply = get_cached_sms_reply(message_sid)
+        try:
+            cached_reply = get_cached_sms_reply(message_sid)
+        except Exception:
+            cached_reply = None
         if cached_reply:
             twiml = MessagingResponse()
             twiml.message(cached_reply)
             return PlainTextResponse(str(twiml), media_type="application/xml")
 
-    reply_text = build_sms_reply(from_number, question)
+    try:
+        reply_text = build_sms_reply(from_number, question)
+    except Exception:
+        reply_text = NOT_FOUND_RESPONSE
 
     if message_sid:
-        cache_sms_reply(message_sid, _normalize_phone(from_number), question, reply_text)
+        try:
+            cache_sms_reply(message_sid, _normalize_phone(from_number), question, reply_text)
+        except Exception:
+            pass
 
     twiml = MessagingResponse()
     twiml.message(reply_text)
