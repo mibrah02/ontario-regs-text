@@ -1,12 +1,15 @@
 from __future__ import annotations
+
 import json
 import os
-from urllib.parse import quote
+import re
+import unicodedata
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 
 from app.db import (
@@ -36,6 +39,47 @@ GUIDANCE_RESPONSE = (
 TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
 PAYWALL_TEST_PREFIX = "PAYWALL "
 SEEDED_PAID_NUMBERS = {item.strip() for item in os.getenv("SEEDED_PAID_NUMBERS", "").split(",") if item.strip()}
+SMS_SEGMENT_LIMIT = max(1, int(os.getenv("SMS_SEGMENT_LIMIT", "2")))
+SMS_TRANSLATION_TABLE = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2026": "...",
+    }
+)
+STOPWORDS = {
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "can",
+    "i",
+    "are",
+    "is",
+    "the",
+    "for",
+    "in",
+    "of",
+    "to",
+    "my",
+    "on",
+    "and",
+    "a",
+    "an",
+    "do",
+    "does",
+}
 
 
 @asynccontextmanager
@@ -67,6 +111,124 @@ def _is_seeded_paid_number(phone: str) -> bool:
 def _payment_entry_url(phone: str) -> str:
     base_url = os.environ["BASE_URL"].rstrip("/")
     return f"{base_url}/buy/{quote(_normalize_phone(phone), safe='')}"
+
+
+def _normalize_sms_transport(text: str) -> str:
+    text = text.translate(SMS_TRANSLATION_TABLE)
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return text.strip()
+
+
+def _estimate_sms_segments(text: str) -> int:
+    normalized = _normalize_sms_transport(text)
+    length = len(normalized)
+    if length == 0:
+        return 1
+    if length <= 160:
+        return 1
+    return (length + 152) // 153
+
+
+def _answer_components(reply_text: str) -> tuple[str, str, str] | None:
+    normalized = reply_text.strip()
+    prefix_marker = "2026 Ontario Hunting Regulations Summary, p."
+    suffix_marker = '" ontario.ca/hunting'
+    if not normalized.startswith(prefix_marker):
+        return None
+    first_quote = normalized.find('"')
+    last_quote = normalized.rfind('"')
+    if first_quote == -1 or last_quote <= first_quote:
+        return None
+    if suffix_marker not in normalized[last_quote:]:
+        return None
+    prefix = normalized[:first_quote]
+    quote = normalized[first_quote + 1:last_quote]
+    suffix = normalized[last_quote + 2:]
+    if not quote or not suffix.startswith("ontario.ca/hunting"):
+        return None
+    return prefix, quote, suffix
+
+
+def _question_keywords(question: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", question.lower())
+        if len(word) >= 4 and word not in STOPWORDS
+    }
+
+
+def _trim_fragment_to_relevant_start(question: str, fragment: str) -> str:
+    lowered_question = question.lower()
+    lowered_fragment = fragment.lower()
+    priority_phrases: list[str] = []
+    if "limit" in lowered_question:
+        priority_phrases.extend(["daily limit", "daily limits", "possession limit", "possession limits"])
+    if "season" in lowered_question:
+        priority_phrases.extend(["open season", "season"])
+    if "orange" in lowered_question:
+        priority_phrases.append("orange")
+    if "tag" in lowered_question:
+        priority_phrases.append("tag")
+    if "wmu" in lowered_question:
+        priority_phrases.append("wmu")
+
+    for phrase in priority_phrases:
+        index = lowered_fragment.find(phrase)
+        if index != -1:
+            return fragment[index:].strip()
+    return fragment.strip()
+
+
+def _shorten_answer_quote(question: str, quote: str) -> str:
+    keywords = _question_keywords(question)
+    if not keywords:
+        return quote.strip()
+
+    fragments = [fragment.strip() for fragment in re.split(r"(?<=\.)\s+", quote) if fragment.strip()]
+    if len(fragments) <= 1:
+        return _trim_fragment_to_relevant_start(question, quote)
+
+    selected: list[str] = []
+    for fragment in fragments:
+        lowered = fragment.lower()
+        overlap = sum(1 for keyword in keywords if keyword in lowered)
+        if overlap > 0:
+            trimmed = _trim_fragment_to_relevant_start(question, fragment)
+            if trimmed and trimmed not in selected:
+                selected.append(trimmed)
+
+    if not selected:
+        return _trim_fragment_to_relevant_start(question, quote)
+    return " ".join(selected).strip()
+
+
+def _fit_reply_to_sms_limit(question: str, reply_text: str) -> str:
+    normalized = _normalize_sms_transport(reply_text)
+    if _estimate_sms_segments(normalized) <= SMS_SEGMENT_LIMIT:
+        return normalized
+
+    parts = _answer_components(normalized)
+    if not parts:
+        return normalized
+
+    prefix, quote, suffix = parts
+    shortened_quote = _shorten_answer_quote(question, quote)
+    candidate = _normalize_sms_transport(f'{prefix}"{shortened_quote}" {suffix}')
+    if _estimate_sms_segments(candidate) <= SMS_SEGMENT_LIMIT:
+        return candidate
+
+    if "." in shortened_quote:
+        first_sentence = shortened_quote.split(".", 1)[0].strip()
+        if first_sentence:
+            fallback = _normalize_sms_transport(f'{prefix}"{first_sentence}." {suffix}')
+            if _estimate_sms_segments(fallback) <= SMS_SEGMENT_LIMIT:
+                return fallback
+
+    return candidate
 
 
 def _serialize_pending_state(question: str, expected_detail: str | None) -> str:
@@ -130,35 +292,35 @@ def build_sms_reply(from_number: str, question: str) -> str:
     if question.startswith(PAYWALL_TEST_PREFIX):
         try:
             get_checkout_url(from_number)
-            return f"First 3 free. Unlimited: {_payment_entry_url(from_number)}"
+            return _fit_reply_to_sms_limit(question, f"First 3 free. Unlimited: {_payment_entry_url(from_number)}")
         except Exception:
-            return "Free limit reached. Payment link unavailable. Try again later."
+            return _fit_reply_to_sms_limit(question, "Free limit reached. Payment link unavailable. Try again later.")
 
     pending_state = _pending_state(from_number)
     intake = _safe_intake(question, pending_state)
 
     if intake.action in {"guide", "clarify"}:
         _track_intake(from_number, intake)
-        return intake.reply_text or GUIDANCE_RESPONSE
+        return _fit_reply_to_sms_limit(question, intake.reply_text or GUIDANCE_RESPONSE)
 
     search_question = intake.normalized_question or question
     clear_pending_clarification(_normalize_phone(from_number))
 
     if _is_test_bypass_number(from_number):
-        return _safe_answer(from_number, search_question)
+        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
 
     if _is_seeded_paid_number(from_number) or is_paid_user(from_number):
-        return _safe_answer(from_number, search_question)
+        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
 
     free_count = increment_free_question_count(_normalize_phone(from_number))
     if free_count <= FREE_QUESTION_LIMIT:
-        return _safe_answer(from_number, search_question)
+        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
 
     try:
         get_checkout_url(from_number)
-        return f"First 3 free. Unlimited: {_payment_entry_url(from_number)}"
+        return _fit_reply_to_sms_limit(question, f"First 3 free. Unlimited: {_payment_entry_url(from_number)}")
     except Exception:
-        return "Free limit reached. Payment link unavailable. Try again later."
+        return _fit_reply_to_sms_limit(question, "Free limit reached. Payment link unavailable. Try again later.")
 
 
 @app.get("/health")
@@ -225,7 +387,7 @@ async def sms_webhook(request: Request) -> PlainTextResponse:
     try:
         reply_text = build_sms_reply(from_number, question)
     except Exception:
-        reply_text = NOT_FOUND_RESPONSE
+        reply_text = _fit_reply_to_sms_limit(question, NOT_FOUND_RESPONSE)
 
     if message_sid:
         try:

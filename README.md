@@ -133,6 +133,7 @@ https://<your-domain>/stripe
    - `ANSWER_TIMEOUT_SECONDS=5.5`
    - `OPENAI_MAX_RETRIES=1`
    - `MODEL_CALL_WORKERS=4`
+   - `SMS_SEGMENT_LIMIT=2`
 5. In Railway shell or predeploy command, build the index once:
 
 ```bash
@@ -179,6 +180,7 @@ curl -X POST http://127.0.0.1:8000/sms \
 - Free usage, clarification state, inbound SMS caching, and processed Stripe events are stored in the database.
 - Incoming SMS first go through a small intent-model call so the bot can interpret natural messages before quote retrieval.
 - Intake, rewrite, and final answer model calls all have bounded deadlines and fail closed so the SMS webhook returns a reply instead of hanging.
+- Outbound SMS replies are normalized to carrier-friendly ASCII and fit to a segment budget so Twilio Trial accounts do not drop long Unicode replies.
 - The app accepts Railway-style `postgres://` or `postgresql://` values and normalizes them to SQLAlchemy `postgresql+psycopg://`.
 - Duplicate Twilio deliveries reuse the cached reply instead of recomputing retrieval or incrementing usage.
 - Duplicate Stripe webhook events are ignored safely after the first successful processing.

@@ -135,6 +135,30 @@ class LlmResilienceTests(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
         self.assertEqual(first.text, second.text)
 
+    def test_sms_reply_is_normalized_for_trial_segment_budget(self) -> None:
+        original_interpret = main_module.interpret_incoming_message
+        original_answer = main_module.answer_question_result
+        try:
+            main_module.interpret_incoming_message = lambda question, pending_state=None: rag_module.IntakeOutcome(
+                action="search",
+                normalized_question=question,
+            )
+            main_module.answer_question_result = lambda question: AnswerOutcome(
+                text=(
+                    '2026 Ontario Hunting Regulations Summary, p.96: "Cottontail and European hare 36, 37, 42–50, 53–95 Daily limit of 5 Cottontail and 3 European Hare. Possession limit of 15 of each species." '
+                    'ontario.ca/hunting\nInformational only. Not legal advice. Verify current regs.'
+                ),
+                kind="answer",
+            )
+            reply = main_module.build_sms_reply(main_module.TEST_BYPASS_PHONE, "what are daily limits for rabbits")
+        finally:
+            main_module.interpret_incoming_message = original_interpret
+            main_module.answer_question_result = original_answer
+
+        self.assertNotIn("–", reply)
+        self.assertIn("42-50", reply)
+        self.assertLessEqual(main_module._estimate_sms_segments(reply), main_module.SMS_SEGMENT_LIMIT)
+
     def test_build_sms_reply_survives_intake_exception(self) -> None:
         original_interpret = main_module.interpret_incoming_message
         original_answer = main_module.answer_question_result
