@@ -105,6 +105,16 @@ class SmsGuidanceTests(unittest.TestCase):
         fresh = main_module.build_sms_reply(self.phone, "guns")
         self.assertIn("Ask an Ontario hunting question", fresh)
 
+    def test_broad_species_interest_returns_natural_species_guidance(self) -> None:
+        reply = main_module.build_sms_reply(self.phone, "how do I hunt deer")
+        self.assertIn("Deer hunting is covered here", reply)
+        self.assertIn("deer season", reply)
+
+    def test_broad_general_interest_returns_specific_question_prompt(self) -> None:
+        reply = main_module.build_sms_reply(self.phone, "what can I hunt in Ontario")
+        self.assertIn("Many species are covered", reply)
+        self.assertIn("duck daily bag limit", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

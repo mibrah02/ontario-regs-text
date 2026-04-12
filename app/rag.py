@@ -921,6 +921,36 @@ def _looks_like_new_question(message: str, pending_question: str, expected_detai
     return lowered.startswith(("what", "when", "where", "which", "who", "can", "do", "does", "is", "are", "how", "tell me"))
 
 
+def _message_is_broad_interest(question: str) -> bool:
+    lowered = question.lower().strip()
+    if any(term in lowered for term in TOPIC_HINT_TERMS):
+        return False
+    return any(term in lowered for term in BROAD_QUERY_TERMS)
+
+
+def _natural_species_interest_outcome(question: str) -> AnswerOutcome | None:
+    species_terms = _extract_species_terms(question)
+    if len(species_terms) != 1:
+        return None
+    if not _message_is_broad_interest(question):
+        return None
+    species = next(iter(species_terms))
+    return _clarification_outcome(_supported_species_prompt(species), species, "topic")
+
+
+def _natural_general_interest_outcome(question: str) -> AnswerOutcome | None:
+    lowered = question.lower().strip()
+    if _extract_species_terms(question):
+        return None
+    if not _message_is_broad_interest(question):
+        return None
+    return _clarification_outcome(
+        "Many species are covered in the official summaries. Ask one specific question, for example: deer season, rabbit daily limit, or duck daily bag limit in the Southern District. Informational only. Not legal advice. Verify current regs.",
+        "hunting species",
+        "topic",
+    )
+
+
 def _supported_species_prompt(species: str) -> str:
     examples = {
         "rabbit": "rabbit daily limit, rabbit possession limit, or rabbit season in your WMU",
@@ -1043,6 +1073,24 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
         if action in {"guide", "clarify"} and not reply_text:
             raise ValueError("Missing reply_text for non-search action")
 
+        natural_species = _natural_species_interest_outcome(message)
+        if action != "search" and natural_species is not None:
+            return IntakeOutcome(
+                action="clarify",
+                reply_text=natural_species.text,
+                pending_question=natural_species.pending_question,
+                expected_detail=natural_species.expected_detail,
+            )
+
+        natural_general = _natural_general_interest_outcome(message)
+        if action != "search" and natural_general is not None:
+            return IntakeOutcome(
+                action="clarify",
+                reply_text=natural_general.text,
+                pending_question=natural_general.pending_question,
+                expected_detail=natural_general.expected_detail,
+            )
+
         if action == "clarify" and stored_detail == "topic" and _message_has_specific_topic_hint(message):
             action = "search"
             normalized_question = message.strip()
@@ -1093,6 +1141,11 @@ BROAD_QUERY_TERMS = (
     "what are",
     "what is",
     "can i",
+    "am i allowed",
+    "how do i hunt",
+    "i want to hunt",
+    "tell me about",
+    "what can i hunt",
 )
 TOPIC_HINT_TERMS = (
     "season",
@@ -1192,7 +1245,7 @@ def _broad_general_question_clarification(question: str) -> AnswerOutcome | None
         return None
 
     return _clarification_outcome(
-        "Ask one specific Ontario hunting question, for example: deer season in WMU 65, rabbit daily limit, or duck daily bag limit in the Southern District. Informational only. Not legal advice. Verify current regs.",
+        "Many species are covered in the official summaries. Ask one specific question, for example: deer season in WMU 65, rabbit daily limit, or duck daily bag limit in the Southern District. Informational only. Not legal advice. Verify current regs.",
         question,
         "topic",
     )
