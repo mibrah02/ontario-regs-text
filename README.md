@@ -1,11 +1,11 @@
 # Ontario Regs Text
 
-Production-ready SMS bot for Ontario hunting regulation questions. The bot only returns exact quotes from the 2026 Ontario Hunting Regulations Summary PDF with a page reference and disclaimer.
+Production-ready SMS bot for Ontario hunting regulation questions. The bot only returns exact quotes from the official Ontario hunting summary and the official Ontario migratory birds summary, with page references and disclaimers.
 
 ## What is included
 
 - FastAPI app with `/sms`, `/stripe`, and `/health`
-- PDF-to-FAISS indexing pipeline using LangChain + OpenAI embeddings
+- Multi-source PDF-to-FAISS indexing pipeline using LangChain + OpenAI embeddings
 - LLM-based SMS intake layer that interprets greetings, vague questions, and follow-ups before retrieval
 - SQLAlchemy-backed app state with SQLite by default and Railway/Postgres-ready configuration
 - Idempotent Twilio SMS caching and Stripe webhook processing
@@ -30,19 +30,14 @@ Production-ready SMS bot for Ontario hunting regulation questions. The bot only 
 
 ## Liability guardrail
 
-The answer path is locked to this exact system prompt:
+The answer path is locked to a source-aware quote-only prompt in [`app/rag.py`](/Users/mohamedi/Documents/ontario-regs-text/app/rag.py). It only allows exact quotes from the official indexed sources and formats answers like:
 
 ```text
-You are a search tool for the 2026 Ontario Hunting Regulations Summary only.
-Never summarize, never interpret, never use outside knowledge.
-User question: {question}
-Relevant pages: {pages}
-If the answer is clearly on these pages, reply with EXACTLY this format:
-'2026 Ontario Hunting Regulations Summary, p.{page}: "{exact sentence from PDF}" ontario.ca/hunting
-Informational only. Not legal advice. Verify current regs.'
-If not found, reply: 'Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs.'
-Do not add anything else.
+{source_title}, p.{page}: "{exact sentence from PDF}" {citation_url}
+Informational only. Not legal advice. Verify current regs.
 ```
+
+If no matching quote is found in the indexed official sources, it returns the safe fallback.
 
 ## Local setup
 
@@ -55,15 +50,17 @@ pip install -r requirements.txt
 ```
 
 4. Copy `.env.example` to `.env` and fill in the values.
-5. The repo already expects the PDF at `data/2026-ontario-hunting-regulations-summary.pdf`.
-6. If you replace that file, keep the same filename or update `SOURCE_PDF_PATH`.
+5. The repo expects these PDFs:
+   - `data/2026-ontario-hunting-regulations-summary.pdf`
+   - `data/ontario-migratory-birds-2025-2026.pdf`
+6. If you replace either file, keep the same filenames or update `SOURCE_PDF_PATH` and `FEDERAL_WATERFOWL_PDF_PATH`.
 7. Build the FAISS index:
 
 ```bash
 python -c "from app.rag import build_index; build_index()"
 ```
 
-This writes `data/index.faiss` and `data/index.pkl`.
+This writes `data/index.faiss` and `data/index.pkl` using both official sources when both PDFs are present.
 
 8. Start the app:
 
@@ -121,6 +118,7 @@ https://<your-domain>/stripe
    - `TWILIO_AUTH_TOKEN`
    - `BASE_URL`
    - `SOURCE_PDF_PATH=data/2026-ontario-hunting-regulations-summary.pdf`
+   - `FEDERAL_WATERFOWL_PDF_PATH=data/ontario-migratory-birds-2025-2026.pdf`
    - `FAISS_INDEX_DIR=data`
    - `DATABASE_URL=sqlite+pysqlite:///data/app.db`
    - `SQLITE_DB_PATH=data/app.db`
@@ -185,5 +183,6 @@ curl -X POST http://127.0.0.1:8000/sms \
 - Duplicate Twilio deliveries reuse the cached reply instead of recomputing retrieval or incrementing usage.
 - Duplicate Stripe webhook events are ignored safely after the first successful processing.
 - The bot never uses outside knowledge by design.
-- If retrieval is unclear, it must return the `Not found in 2026 Summary...` fallback.
+- Waterfowl / migratory bird answers are sourced from the official federal Ontario migratory bird summary, not the Ontario provincial hunting summary.
+- If retrieval is unclear, it must return the safe fallback for the official indexed summaries.
 - Stripe webhook setup can wait until after deployment, when you have the real public `/stripe` URL.

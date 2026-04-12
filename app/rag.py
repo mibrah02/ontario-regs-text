@@ -5,8 +5,8 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from time import monotonic
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from dotenv import load_dotenv
@@ -18,11 +18,17 @@ from pypdf import PdfReader
 
 load_dotenv()
 
-PDF_URL = "https://www.ontario.ca/document/ontario-hunting-regulations-summary"
+PROVINCIAL_SOURCE_URL = "https://www.ontario.ca/document/ontario-hunting-regulations-summary"
+PROVINCIAL_CITATION_URL = "ontario.ca/hunting"
+FEDERAL_MIGRATORY_SOURCE_URL = "https://www.canada.ca/en/environment-climate-change/services/migratory-game-bird-hunting/regulations-provincial-territorial-summaries/ontario.html"
+FEDERAL_MIGRATORY_PDF_URL = "https://www.canada.ca/content/dam/eccc/documents/pdf/oiseaux-migrateurs-migratory-bird/arcom-mbhrs/2025-2026/25038.01-CWS-MBHS-2025-2026-WEB-ON-V03-EN.pdf"
+FEDERAL_MIGRATORY_CITATION_URL = "canada.ca/migratory-game-bird-hunting"
+PDF_URL = PROVINCIAL_SOURCE_URL
 DEFAULT_PDF_PATH = Path(os.getenv("SOURCE_PDF_PATH", "data/2026-ontario-hunting-regulations-summary.pdf"))
+FEDERAL_WATERFOWL_PDF_PATH = Path(os.getenv("FEDERAL_WATERFOWL_PDF_PATH", "data/ontario-migratory-birds-2025-2026.pdf"))
 INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", "data"))
 NOT_FOUND_RESPONSE = (
-    "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. "
+    "Not found in the official Ontario hunting or Ontario migratory bird summaries. Check ontario.ca or canada.ca. "
     "Informational only. Not legal advice. Verify current regs."
 )
 INTAKE_MODEL = os.getenv("INTAKE_MODEL", "gpt-4o-mini")
@@ -37,25 +43,58 @@ MODEL_CALL_POOL = ThreadPoolExecutor(max_workers=MODEL_CALL_WORKERS)
 ANSWER_CACHE_TTL_SECONDS = float(os.getenv("ANSWER_CACHE_TTL_SECONDS", "21600"))
 ANSWER_CACHE_MAX_ITEMS = max(32, int(os.getenv("ANSWER_CACHE_MAX_ITEMS", "512")))
 ANSWER_CACHE: dict[str, tuple[float, "AnswerOutcome"]] = {}
-SYSTEM_PROMPT = """You are a search tool for the 2026 Ontario Hunting Regulations Summary only.
+SYSTEM_PROMPT = """You are a search tool for the provided official Ontario hunting regulation sources only.
 Never summarize, never interpret, never use outside knowledge.
 User question: {question}
-Relevant pages: {pages}
+Relevant source pages: {pages}
+Each source page includes source_title, citation_url, and page.
 If the answer is clearly on these pages, return the shortest exact quote that answers the question.
 If the source is a table, return only the exact matching row or cell text needed, not the whole table.
-Use the provided table context to distinguish between different season tables or weapon types.
-If multiple relevant entries differ by method, season type, or weapon and the user did not specify enough detail, reply with the not-found fallback.
+Use the provided table context, district, WMU, and method context to distinguish between different entries.
 Preserve source wording, but collapse repeated spaces and line breaks into normal readable spaces.
 Reply with EXACTLY this format:
-'2026 Ontario Hunting Regulations Summary, p.{{page}}: "{{exact sentence from PDF}}" ontario.ca/hunting
+'{{source_title}}, p.{{page}}: "{{exact sentence from PDF}}" {{citation_url}}
 Informational only. Not legal advice. Verify current regs.'
-If not found, reply: 'Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Informational only. Not legal advice. Verify current regs.'
+If not found, reply: '{not_found_response}'
 Do not add anything else."""
-SEARCH_REWRITE_PROMPT = """Rewrite the user question into a short search query for the 2026 Ontario Hunting Regulations Summary.
-Keep species names, WMU numbers, season concepts, licence concepts, and gear terms when relevant.
+SEARCH_REWRITE_PROMPT = """Rewrite the user question into a short search query for the official Ontario hunting and Ontario migratory bird summaries.
+Keep species names, WMU numbers, districts, season concepts, licence concepts, and gear terms when relevant.
 Do not answer the question. Do not add commentary. Return one short search query only.
 User question: {question}
 """
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    source_id: str
+    source_title: str
+    source_url: str
+    citation_url: str
+    pdf_path: Path
+    year: str
+    source_kind: str
+
+
+SOURCES: tuple[SourceSpec, ...] = (
+    SourceSpec(
+        source_id="ontario_hunting_summary_2026",
+        source_title="2026 Ontario Hunting Regulations Summary",
+        source_url=PROVINCIAL_SOURCE_URL,
+        citation_url=PROVINCIAL_CITATION_URL,
+        pdf_path=DEFAULT_PDF_PATH,
+        year="2026",
+        source_kind="provincial",
+    ),
+    SourceSpec(
+        source_id="ontario_migratory_birds_2025_2026",
+        source_title="Ontario Summary of Migratory Birds Hunting Regulations, August 2025 to July 2026",
+        source_url=FEDERAL_MIGRATORY_PDF_URL,
+        citation_url=FEDERAL_MIGRATORY_CITATION_URL,
+        pdf_path=FEDERAL_WATERFOWL_PDF_PATH,
+        year="2025-2026",
+        source_kind="migratory",
+    ),
+)
 
 WMU_ROW_START_RE = re.compile(r"^(?:\d{1,3}[A-Z]?)(?:,\s*\d{1,3}[A-Z]?)*(?:\s*,\s*\d{1,3}[A-Z]?)*\b")
 TABLE_PAGE_MARKERS = ("Wildlife Management Unit", "Resident — open season", "Resident - open season")
@@ -63,7 +102,30 @@ SKIP_LINE_RE = re.compile(
     r"^(?:Hunting Regulations Summary|White-tailed Deer|Wildlife Management Unit|Resident|Non-resident|General Regulations|\d+)$",
     re.IGNORECASE,
 )
-
+MIGRATORY_TABLE_MARKERS = (
+    "Open Seasons and Daily Bag and Possession Limits for Migratory Game Birds in Ontario",
+    "Special Measures for Overabundant Species in Ontario",
+    "Area Species Open Season Daily Bag Limit Possession Limit",
+)
+MIGRATORY_HEADER_SKIP_RE = re.compile(
+    r"^(?:Summary of Migratory Birds|Hunting Regulations|August 2025|to July 2026|Ontario|Open Seasons and Daily Bag and Possession Limits for Migratory Game Birds in Ontario|Area Species Open Season Daily Bag Limit Possession Limit|Special Measures for Overabundant Species in Ontario|The information presented here is a summary of the law\.|For more information, consult|Environment and Climate Change Canada|Canadian Wildlife Service|Regional Office|Tel\.:|enviroinfo@ec\.gc\.ca|Report your Migratory Bird Bands:|www\.reportband\.gov|ISSN )",
+    re.IGNORECASE,
+)
+MIGRATORY_SPECIES_START_RE = re.compile(
+    r"^(?:Ducks\b|Canada Geese\b|Snow Geese\b|Geese \(other than\b|Rails \(other than\b|Woodcock\b|Snipe\b|Mourning Doves\b)",
+    re.IGNORECASE,
+)
+MIGRATORY_DATA_LINE_RE = re.compile(
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December|No open season|N/A|\bNo limit\b|\bin WMU|\bin WMUs|\bmunicipalities\b|\bSunday gun hunting\b)",
+    re.IGNORECASE,
+)
+DISTRICT_PATTERNS = {
+    "hudson-james bay district": "Hudson-James Bay District",
+    "hudson james bay district": "Hudson-James Bay District",
+    "northern district": "Northern District",
+    "central district": "Central District",
+    "southern district": "Southern District",
+}
 
 SPECIES_PATTERNS = {
     "white-tailed deer": "deer",
@@ -80,7 +142,34 @@ SPECIES_PATTERNS = {
     "hare": "rabbit",
     "cottontail": "rabbit",
     "snowshoe": "rabbit",
+    "duck": "duck",
+    "ducks": "duck",
+    "waterfowl": "waterfowl",
+    "migratory bird": "waterfowl",
+    "migratory birds": "waterfowl",
+    "canada goose": "canada goose",
+    "canada geese": "canada goose",
+    "cackling goose": "canada goose",
+    "cackling geese": "canada goose",
+    "snow goose": "snow goose",
+    "snow geese": "snow goose",
+    "ross's goose": "snow goose",
+    "ross's geese": "snow goose",
+    "goose": "goose",
+    "geese": "goose",
+    "mourning dove": "mourning dove",
+    "woodcock": "woodcock",
+    "snipe": "snipe",
+    "rail": "rail",
+    "rails": "rail",
+    "coot": "coot",
+    "coots": "coot",
+    "gallinule": "gallinule",
+    "gallinules": "gallinule",
 }
+WATERFOWL_SPECIES = {"duck", "waterfowl", "canada goose", "snow goose", "goose", "mourning dove", "woodcock", "snipe", "rail", "coot", "gallinule"}
+WATERFOWL_DETAIL_TERMS = ("season", "bag", "daily", "limit", "possession", "open season")
+
 
 def _get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(model="text-embedding-3-small")
@@ -162,6 +251,23 @@ def _prune_answer_cache(now: float) -> None:
         ANSWER_CACHE.pop(key, None)
 
 
+@dataclass
+class AnswerOutcome:
+    text: str
+    kind: str
+    pending_question: str | None = None
+    expected_detail: str | None = None
+
+
+@dataclass
+class IntakeOutcome:
+    action: str
+    normalized_question: str = ""
+    reply_text: str = ""
+    pending_question: str | None = None
+    expected_detail: str | None = None
+
+
 def _get_cached_answer(question: str):
     key = _normalize_question_cache_key(question)
     if not key:
@@ -182,7 +288,7 @@ def _get_cached_answer(question: str):
     )
 
 
-def _set_cached_answer(question: str, outcome: "AnswerOutcome") -> None:
+def _set_cached_answer(question: str, outcome: AnswerOutcome) -> None:
     key = _normalize_question_cache_key(question)
     if not key:
         return
@@ -223,18 +329,12 @@ def _format_exact_quote(document: Document) -> str:
     if document.metadata.get("chunk_type") == "table_row":
         quote = _compress_repeated_table_row(quote)
     quote = quote.replace('"', '\\"')
+    source_title = document.metadata.get("source_title", "Official Hunting Summary")
+    citation_url = document.metadata.get("citation_url", PROVINCIAL_CITATION_URL)
     return (
-        f'2026 Ontario Hunting Regulations Summary, p.{page}: "{quote}" ontario.ca/hunting\n'
+        f'{source_title}, p.{page}: "{quote}" {citation_url}\n'
         "Informational only. Not legal advice. Verify current regs."
     )
-
-
-def _infer_species(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern, label in SPECIES_PATTERNS.items():
-        if pattern in lowered:
-            return label
-    return None
 
 
 def _extract_species_terms(question: str) -> set[str]:
@@ -242,8 +342,24 @@ def _extract_species_terms(question: str) -> set[str]:
     return {label for pattern, label in SPECIES_PATTERNS.items() if pattern in lowered}
 
 
+def _infer_species(text: str) -> str | None:
+    matches = _extract_species_terms(text)
+    if len(matches) == 1:
+        return next(iter(matches))
+    lowered = text.lower()
+    for pattern, label in SPECIES_PATTERNS.items():
+        if pattern in lowered:
+            return label
+    return None
+
+
 def _extract_wmu_terms(question: str) -> set[str]:
     return {match.upper() for match in re.findall(r"\b(?:WMU\s*)?(\d{1,3}[A-Z]?)\b", question, re.IGNORECASE)}
+
+
+def _extract_district_terms(question: str) -> set[str]:
+    lowered = question.lower()
+    return {label for pattern, label in DISTRICT_PATTERNS.items() if pattern in lowered}
 
 
 def _extract_method_terms(question: str) -> set[str]:
@@ -272,26 +388,58 @@ def _doc_matches_method(document: Document, method_terms: set[str]) -> bool:
     return False
 
 
+def _doc_matches_district(document: Document, district_terms: set[str]) -> bool:
+    if not district_terms:
+        return True
+    return document.metadata.get("district") in district_terms
+
+
+def _doc_matches_species(document: Document, species_terms: set[str]) -> bool:
+    doc_species = str(document.metadata.get("species", "")).strip().lower()
+    if not species_terms:
+        return True
+    if doc_species in species_terms:
+        return True
+    if "goose" in species_terms and doc_species in {"goose", "canada goose", "snow goose"}:
+        return True
+    if "waterfowl" in species_terms and doc_species in WATERFOWL_SPECIES:
+        return True
+    return False
+
+
 def _direct_structured_match(vectorstore: FAISS, question: str) -> list[Document]:
     species_terms = _extract_species_terms(question)
     wmu_terms = _extract_wmu_terms(question)
     method_terms = _extract_method_terms(question)
-    if not species_terms or not wmu_terms or not method_terms:
-        return []
+    district_terms = _extract_district_terms(question)
 
-    candidates: list[Document] = []
-    for document in vectorstore.docstore._dict.values():
-        if document.metadata.get("chunk_type") != "table_row":
-            continue
-        if species_terms and document.metadata.get("species") not in species_terms:
-            continue
-        if not _doc_matches_wmu(document, wmu_terms):
-            continue
-        if not _doc_matches_method(document, method_terms):
-            continue
-        candidates.append(document)
+    if species_terms and wmu_terms and method_terms:
+        candidates: list[Document] = []
+        for document in vectorstore.docstore._dict.values():
+            if document.metadata.get("chunk_type") != "table_row":
+                continue
+            if not _doc_matches_species(document, species_terms):
+                continue
+            if not _doc_matches_wmu(document, wmu_terms):
+                continue
+            if not _doc_matches_method(document, method_terms):
+                continue
+            candidates.append(document)
+        return candidates[:3]
 
-    return candidates[:3]
+    if species_terms and district_terms:
+        candidates = []
+        for document in vectorstore.docstore._dict.values():
+            if document.metadata.get("chunk_type") != "table_row":
+                continue
+            if not _doc_matches_district(document, district_terms):
+                continue
+            if not _doc_matches_species(document, species_terms):
+                continue
+            candidates.append(document)
+        return candidates[:3]
+
+    return []
 
 
 def _extract_paragraph_chunks(page_text: str) -> list[str]:
@@ -363,8 +511,134 @@ def _extract_table_row_chunks(page_text: str) -> list[str]:
     return deduped
 
 
-def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
-    reader = PdfReader(str(pdf_path))
+def _looks_like_migratory_area_start(line: str) -> bool:
+    lowered = line.lower()
+    return lowered in {
+        "hudson-james bay district",
+        "northern district",
+        "central district",
+        "southern district",
+        "hudson-james",
+        "hudson-james bay",
+        "northern",
+        "central",
+        "southern",
+    } or lowered.startswith("southern district (")
+
+
+def _normalize_migratory_lines(page_text: str) -> list[str]:
+    raw_lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    lines: list[str] = []
+    index = 0
+    while index < len(raw_lines):
+        line = raw_lines[index]
+        next_line = raw_lines[index + 1] if index + 1 < len(raw_lines) else ""
+        if line in {"Hudson-James", "Hudson-James Bay", "Northern", "Central", "Southern"} and next_line in {"Bay District", "District"}:
+            lines.append(f"{line} {next_line}")
+            index += 2
+            continue
+        if line == "Hudson-James Bay" and next_line == "District":
+            lines.append("Hudson-James Bay District")
+            index += 2
+            continue
+        lines.append(line)
+        index += 1
+    return lines
+
+
+def _extract_migratory_table_row_chunks(page_text: str) -> list[dict[str, str]]:
+    if not any(marker in page_text for marker in MIGRATORY_TABLE_MARKERS):
+        return []
+
+    lines = _normalize_migratory_lines(page_text)
+    rows: list[dict[str, str]] = []
+    current_area_parts: list[str] = []
+    species_lines: list[str] = []
+    data_lines: list[str] = []
+
+    def current_area() -> str:
+        return _normalize_inline(" ".join(current_area_parts))
+
+    def flush() -> None:
+        nonlocal species_lines, data_lines
+        area = current_area()
+        if not area or not species_lines or not data_lines:
+            species_lines = []
+            data_lines = []
+            return
+        species_text = _normalize_inline(" ".join(species_lines))
+        text = _normalize_inline("\n".join([area, species_text, *data_lines]))
+        if len(text) < 30:
+            species_lines = []
+            data_lines = []
+            return
+        rows.append(
+            {
+                "text": text,
+                "district": area,
+                "species": _infer_species(species_text) or _infer_species(text) or "",
+                "table_context": area,
+            }
+        )
+        species_lines = []
+        data_lines = []
+
+    for line in lines:
+        if MIGRATORY_HEADER_SKIP_RE.match(line):
+            continue
+        if line.startswith("Notice:"):
+            continue
+        if line.startswith("For more information") or line.startswith("You may also direct your questions"):
+            flush()
+            break
+
+        if _looks_like_migratory_area_start(line):
+            flush()
+            current_area_parts = [line]
+            continue
+
+        if current_area_parts and not species_lines and not MIGRATORY_SPECIES_START_RE.match(line) and not MIGRATORY_DATA_LINE_RE.search(line):
+            current_area_parts.append(line)
+            continue
+
+        if MIGRATORY_SPECIES_START_RE.match(line):
+            flush()
+            species_lines = [line]
+            data_lines = []
+            continue
+
+        if species_lines and not data_lines and not MIGRATORY_DATA_LINE_RE.search(line):
+            species_lines.append(line)
+            continue
+
+        if species_lines:
+            data_lines.append(line)
+
+    flush()
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row["text"] not in seen:
+            deduped.append(row)
+            seen.add(row["text"])
+    return deduped
+
+
+def _base_metadata(source: SourceSpec, page_num: int) -> dict[str, Any]:
+    return {
+        "page_num": page_num,
+        "year": source.year,
+        "url": source.source_url,
+        "source_id": source.source_id,
+        "source_title": source.source_title,
+        "citation_url": source.citation_url,
+        "source_kind": source.source_kind,
+    }
+
+
+def _page_documents_from_source(source: SourceSpec) -> list[Document]:
+    reader = PdfReader(str(source.pdf_path))
     documents: list[Document] = []
 
     for index, page in enumerate(reader.pages, start=1):
@@ -372,51 +646,83 @@ def _page_documents_from_pdf(pdf_path: str | Path) -> list[Document]:
         if not page_text:
             continue
 
-        metadata = {
-            "page_num": index,
-            "year": 2026,
-            "url": PDF_URL,
-        }
-        species = _infer_species(page_text)
-        if species:
-            metadata["species"] = species
+        metadata = _base_metadata(source, index)
+        page_species = _infer_species(page_text)
+        page_metadata = dict(metadata)
+        if page_species and len(_extract_species_terms(page_text)) == 1:
+            page_metadata["species"] = page_species
 
-        documents.append(
-            Document(
-                page_content=page_text,
-                metadata={**metadata, "chunk_type": "page"},
-            )
-        )
+        documents.append(Document(page_content=page_text, metadata={**page_metadata, "chunk_type": "page"}))
 
         for paragraph in _extract_paragraph_chunks(page_text):
+            paragraph_metadata = dict(metadata)
+            paragraph_species = _infer_species(paragraph)
+            if paragraph_species and len(_extract_species_terms(paragraph)) == 1:
+                paragraph_metadata["species"] = paragraph_species
+            elif page_species and len(_extract_species_terms(page_text)) == 1:
+                paragraph_metadata["species"] = page_species
             documents.append(
                 Document(
                     page_content=paragraph,
-                    metadata={**metadata, "chunk_type": "paragraph"},
+                    metadata={**paragraph_metadata, "chunk_type": "paragraph"},
                 )
             )
 
-        table_context = _extract_table_context(page_text)
-        for row in _extract_table_row_chunks(page_text):
-            row_metadata = {**metadata, "chunk_type": "table_row"}
-            if table_context:
-                row_metadata["table_context"] = table_context
-            documents.append(
-                Document(
-                    page_content=row,
-                    metadata=row_metadata,
-                )
-            )
+        if source.source_kind == "provincial":
+            table_context = _extract_table_context(page_text)
+            for row in _extract_table_row_chunks(page_text):
+                row_metadata = {**metadata, "chunk_type": "table_row"}
+                if table_context:
+                    row_metadata["table_context"] = table_context
+                row_species = _infer_species(row) or page_species
+                if row_species:
+                    row_metadata["species"] = row_species
+                documents.append(Document(page_content=row, metadata=row_metadata))
+            continue
+
+        for row in _extract_migratory_table_row_chunks(page_text):
+            row_metadata = {
+                **metadata,
+                "chunk_type": "table_row",
+                "table_context": row.get("table_context", ""),
+                "district": row.get("district", ""),
+            }
+            if row.get("species"):
+                row_metadata["species"] = row["species"]
+            documents.append(Document(page_content=row["text"], metadata=row_metadata))
 
     if not documents:
-        raise ValueError("No text could be extracted from the PDF.")
+        raise ValueError(f"No text could be extracted from the PDF: {source.pdf_path}")
 
     return documents
 
 
+def _configured_sources() -> list[SourceSpec]:
+    return [source for source in SOURCES if source.pdf_path.exists()]
+
+
 def build_index(pdf_path: str | Path = DEFAULT_PDF_PATH) -> None:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    documents = _page_documents_from_pdf(pdf_path)
+    primary_override = Path(pdf_path)
+    documents: list[Document] = []
+    for source in SOURCES:
+        if source.source_id == "ontario_hunting_summary_2026":
+            actual_source = SourceSpec(
+                source_id=source.source_id,
+                source_title=source.source_title,
+                source_url=source.source_url,
+                citation_url=source.citation_url,
+                pdf_path=primary_override,
+                year=source.year,
+                source_kind=source.source_kind,
+            )
+        else:
+            actual_source = source
+        if not actual_source.pdf_path.exists():
+            continue
+        documents.extend(_page_documents_from_source(actual_source))
+    if not documents:
+        raise FileNotFoundError("No source PDFs were found for indexing.")
     vectorstore = FAISS.from_documents(documents, _get_embeddings())
     vectorstore.save_local(str(INDEX_DIR))
 
@@ -440,7 +746,6 @@ def _load_vectorstore() -> FAISS:
     )
 
 
-
 def _rewrite_search_query(question: str) -> str:
     try:
         response = _invoke_model_call(
@@ -462,21 +767,23 @@ def _extract_query_terms(question: str) -> set[str]:
 def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
     query_terms = _extract_query_terms(question)
     species_terms = _extract_species_terms(question)
+    district_terms = _extract_district_terms(question)
 
-    def sort_key(document: Document) -> tuple[int, int, int]:
+    def sort_key(document: Document) -> tuple[int, int, int, int]:
         content = document.page_content.upper()
         overlap = sum(1 for term in query_terms if term in content)
         table_bonus = 1 if document.metadata.get("chunk_type") == "table_row" else 0
-        species_bonus = 1 if species_terms and document.metadata.get("species") in species_terms else 0
-        return (species_bonus, overlap, table_bonus)
+        species_bonus = 1 if species_terms and _doc_matches_species(document, species_terms) else 0
+        district_bonus = 1 if district_terms and _doc_matches_district(document, district_terms) else 0
+        return (district_bonus, species_bonus, overlap, table_bonus)
 
     return sorted(documents, key=sort_key, reverse=True)
 
-INTAKE_GUIDANCE_RESPONSE = (
-    "Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. "
-    "I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs."
-)
 
+INTAKE_GUIDANCE_RESPONSE = (
+    "Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. "
+    "I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs."
+)
 
 INTAKE_PROMPT = """You are the intake layer for Ontario Regs Text, an SMS bot that answers Ontario hunting regulation questions.
 Your job is only to understand the user's message and choose the next step.
@@ -487,7 +794,7 @@ action: one of "guide", "clarify", or "search"
 normalized_question: short plain-language query for downstream retrieval, or ""
 reply_text: SMS text to send if action is guide or clarify, or ""
 pending_question: canonical question to store if action is clarify, or ""
-expected_detail: short label like "topic", "method", "wmu", "wmu_and_method", or "detail", or ""
+expected_detail: short label like "topic", "method", "wmu", "wmu_and_method", "district", or "detail", or ""
 
 Rules:
 - Use action=search when the user asked a specific hunting-regs question, even if phrasing is messy.
@@ -496,36 +803,33 @@ Rules:
 - If pending context exists and the new message clearly starts a new question, ignore the pending context.
 - If pending context exists and the new message fills the missing detail, combine it and use action=search.
 - If pending context exists and the new message is meta, confusion, or acknowledgement, use action=clarify and repeat the missing detail briefly.
+- For broad supported-species questions like "can I hunt rabbits in Ontario", keep it natural: you may briefly confirm the species is covered in the official summaries, then ask for one specific question.
+- For waterfowl season or limit questions without a district, ask for the district: Hudson-James Bay, Northern, Central, or Southern.
 - Keep reply_text short and natural for SMS.
 - Never answer from memory and never quote regulations yourself.
 
 Examples:
 1. pending: none | message: "hello"
-{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
+{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
 2. pending: {"question":"when is deer season","expected_detail":"wmu_and_method"} | message: "WMU 65"
 {"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs.","pending_question":"when is deer season in WMU 65","expected_detail":"method"}
 3. pending: {"question":"when is deer season in WMU 65","expected_detail":"method"} | message: "bows only"
 {"action":"search","normalized_question":"when is deer season in WMU 65 bows only","reply_text":"","pending_question":"","expected_detail":""}
 4. pending: none | message: "what rabbits hunting rules"
-{"action":"clarify","normalized_question":"","reply_text":"Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in my WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
-5. pending: none | message: "duck daily limit"
-{"action":"search","normalized_question":"duck daily limit","reply_text":"","pending_question":"","expected_detail":""}
-6. pending: none | message: "guns"
-{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
+{"action":"clarify","normalized_question":"","reply_text":"Rabbit hunting is covered here. Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in your WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
+5. pending: none | message: "can I hunt rabbits in Ontario"
+{"action":"clarify","normalized_question":"","reply_text":"Rabbit hunting is covered here. Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in your WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
+6. pending: none | message: "duck daily limit"
+{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.","pending_question":"duck daily limit","expected_detail":"district"}
+7. pending: none | message: "duck daily limit in Southern District"
+{"action":"search","normalized_question":"duck daily limit Southern District","reply_text":"","pending_question":"","expected_detail":""}
+8. pending: none | message: "guns"
+{"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
 
 Pending question: {pending_question}
 Expected detail: {expected_detail}
 Incoming message: {message}
 """
-
-
-@dataclass
-class IntakeOutcome:
-    action: str
-    normalized_question: str = ""
-    reply_text: str = ""
-    pending_question: str | None = None
-    expected_detail: str | None = None
 
 
 def _normalize_intake_key(text: str) -> str:
@@ -536,9 +840,11 @@ INTAKE_SPECIFIC_TOPIC_TERMS = (
     "season",
     "limit",
     "daily",
+    "bag",
     "possession",
     "wmu",
     "unit",
+    "district",
     "tag",
     "licence",
     "license",
@@ -560,6 +866,7 @@ INTAKE_SPECIFIC_TOPIC_TERMS = (
     "non-resident",
     "calf",
     "antlerless",
+    "shot",
 )
 
 
@@ -573,6 +880,8 @@ def _clarification_reminder_text(expected_detail: str | None) -> str:
         return "Still need one detail: reply with the WMU number, for example WMU 65. Informational only. Not legal advice. Verify current regs."
     if expected_detail == "wmu_and_method":
         return "Still need two details: reply with the WMU number and method, for example WMU 65 bows only. Informational only. Not legal advice. Verify current regs."
+    if expected_detail == "district":
+        return "Still need one detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs."
     if expected_detail == "topic":
         return "Please ask again with one specific topic, for example: daily limit, possession limit, season, tag, or hunter orange. Informational only. Not legal advice. Verify current regs."
     return "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
@@ -585,6 +894,8 @@ def _looks_like_follow_up_fragment(message: str, expected_detail: str | None) ->
     if expected_detail in {"method", "wmu_and_method"} and _question_specifies_method(lowered):
         return True
     if expected_detail in {"wmu", "wmu_and_method"} and _extract_wmu_terms(lowered):
+        return True
+    if expected_detail == "district" and _extract_district_terms(lowered):
         return True
     if expected_detail == "topic":
         return len(re.findall(r"\w+", lowered)) <= 6
@@ -608,6 +919,37 @@ def _looks_like_new_question(message: str, pending_question: str, expected_detai
         return True
 
     return lowered.startswith(("what", "when", "where", "which", "who", "can", "do", "does", "is", "are", "how", "tell me"))
+
+
+def _supported_species_prompt(species: str) -> str:
+    examples = {
+        "rabbit": "rabbit daily limit, rabbit possession limit, or rabbit season in your WMU",
+        "duck": "duck daily bag limit in the Southern District, duck possession limit in the Northern District, or non-toxic shot for migratory birds",
+        "waterfowl": "duck daily bag limit in the Southern District, Canada goose season in the Central District, or non-toxic shot for migratory birds",
+        "canada goose": "Canada goose daily bag limit in the Southern District, Canada goose season in the Central District, or Sunday gun hunting rules",
+        "snow goose": "Snow goose season in the Southern District, Snow goose bag limit, or special conservation harvest dates",
+    }
+    labels = {
+        "rabbit": "Rabbit hunting is covered here.",
+        "duck": "Duck hunting is covered here.",
+        "waterfowl": "Waterfowl hunting is covered here.",
+        "canada goose": "Canada goose hunting is covered here.",
+        "snow goose": "Snow goose hunting is covered here.",
+        "deer": "Deer hunting is covered here.",
+        "moose": "Moose hunting is covered here.",
+        "bear": "Bear hunting is covered here.",
+        "turkey": "Turkey hunting is covered here.",
+        "elk": "Elk hunting is covered here.",
+        "wolf": "Wolf hunting is covered here.",
+        "coyote": "Coyote hunting is covered here.",
+        "mourning dove": "Mourning dove hunting is covered here.",
+        "woodcock": "Woodcock hunting is covered here.",
+        "snipe": "Snipe hunting is covered here.",
+    }
+    fallback_species = species.replace(" ", " ")
+    example_text = examples.get(species, f"{fallback_species} season, {fallback_species} daily limit, or {fallback_species} tag rules")
+    intro = labels.get(species, f"{fallback_species.capitalize()} hunting is covered here.")
+    return f"{intro} Ask one specific {fallback_species} question, for example: {example_text}. Informational only. Not legal advice. Verify current regs."
 
 
 def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
@@ -636,8 +978,27 @@ def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, 
     if not normalized:
         return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
 
-    if len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized))):
+    if len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized)) or bool(_extract_district_terms(normalized))):
         return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    species_terms = _extract_species_terms(message)
+    lowered = message.lower()
+    if len(species_terms) == 1 and any(term in lowered for term in ("can i hunt", "what", "rules", "regulations", "hunt", "hunting")) and not _message_has_specific_topic_hint(message):
+        species = next(iter(species_terms))
+        return IntakeOutcome(
+            action="clarify",
+            reply_text=_supported_species_prompt(species),
+            pending_question=species,
+            expected_detail="topic",
+        )
+
+    if any(species in species_terms for species in WATERFOWL_SPECIES) and any(term in lowered for term in WATERFOWL_DETAIL_TERMS) and not _extract_district_terms(lowered):
+        return IntakeOutcome(
+            action="clarify",
+            reply_text="Need one more detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.",
+            pending_question=message.strip(),
+            expected_detail="district",
+        )
 
     return IntakeOutcome(action="search", normalized_question=message.strip())
 
@@ -707,14 +1068,6 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
         return _fallback_interpret_incoming_message(message, pending_state)
 
 
-@dataclass
-class AnswerOutcome:
-    text: str
-    kind: str
-    pending_question: str | None = None
-    expected_detail: str | None = None
-
-
 METHOD_TERMS = ("bow", "bows", "rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")
 
 
@@ -739,14 +1092,17 @@ BROAD_QUERY_TERMS = (
     "what about",
     "what are",
     "what is",
+    "can i",
 )
 TOPIC_HINT_TERMS = (
     "season",
     "limit",
     "daily",
+    "bag",
     "possession",
     "wmu",
     "unit",
+    "district",
     "tag",
     "licence",
     "license",
@@ -768,6 +1124,7 @@ TOPIC_HINT_TERMS = (
     "non-resident",
     "calf",
     "antlerless",
+    "shot",
 )
 
 
@@ -781,8 +1138,28 @@ def _pretty_species_name(label: str) -> str:
         "wolf": "wolf",
         "coyote": "coyote",
         "rabbit": "rabbit",
+        "duck": "duck",
+        "waterfowl": "waterfowl",
+        "canada goose": "Canada goose",
+        "snow goose": "Snow goose",
+        "goose": "goose",
+        "mourning dove": "mourning dove",
+        "woodcock": "woodcock",
+        "snipe": "snipe",
+        "rail": "rail",
+        "coot": "coot",
+        "gallinule": "gallinule",
     }
     return names.get(label, label)
+
+
+def _clarification_outcome(text: str, question: str, expected_detail: str) -> AnswerOutcome:
+    return AnswerOutcome(
+        text=text,
+        kind="clarify",
+        pending_question=question,
+        expected_detail=expected_detail,
+    )
 
 
 def _broad_species_question_clarification(question: str) -> AnswerOutcome | None:
@@ -796,16 +1173,11 @@ def _broad_species_question_clarification(question: str) -> AnswerOutcome | None
 
     word_count = len(re.findall(r"\w+", lowered))
     has_broad_cue = any(term in lowered for term in BROAD_QUERY_TERMS)
-    if not has_broad_cue and word_count > 3:
+    if not has_broad_cue and word_count > 4:
         return None
 
     species = next(iter(species_terms))
-    species_name = _pretty_species_name(species)
-    return _clarification_outcome(
-        f"Ask one specific {species_name} question, for example: {species_name} daily limit, {species_name} possession limit, or {species_name} season in my WMU. Informational only. Not legal advice. Verify current regs.",
-        question,
-        "topic",
-    )
+    return _clarification_outcome(_supported_species_prompt(species), species, "topic")
 
 
 def _broad_general_question_clarification(question: str) -> AnswerOutcome | None:
@@ -814,13 +1186,13 @@ def _broad_general_question_clarification(question: str) -> AnswerOutcome | None
         return None
 
     word_count = len(re.findall(r"\w+", lowered))
-    if word_count > 5:
+    if word_count > 6:
         return None
     if not any(term in lowered for term in BROAD_QUERY_TERMS):
         return None
 
     return _clarification_outcome(
-        "Ask one specific Ontario hunting question, for example: deer season in WMU 65, rabbit daily limit, or hunter orange requirement. Informational only. Not legal advice. Verify current regs.",
+        "Ask one specific Ontario hunting question, for example: deer season in WMU 65, rabbit daily limit, or duck daily bag limit in the Southern District. Informational only. Not legal advice. Verify current regs.",
         question,
         "topic",
     )
@@ -838,13 +1210,16 @@ def _missing_deer_season_details(question: str) -> list[str]:
     return missing
 
 
-def _clarification_outcome(text: str, question: str, expected_detail: str) -> AnswerOutcome:
-    return AnswerOutcome(
-        text=text,
-        kind="clarify",
-        pending_question=question,
-        expected_detail=expected_detail,
-    )
+def _waterfowl_district_missing(question: str) -> bool:
+    species_terms = _extract_species_terms(question)
+    if not species_terms.intersection(WATERFOWL_SPECIES):
+        return False
+    lowered = question.lower()
+    if not any(term in lowered for term in WATERFOWL_DETAIL_TERMS):
+        return False
+    if _extract_district_terms(question):
+        return False
+    return True
 
 
 def _build_deer_season_clarification(question: str, missing_details: list[str]) -> AnswerOutcome:
@@ -869,6 +1244,16 @@ def _build_deer_season_clarification(question: str, missing_details: list[str]) 
     )
 
 
+def _build_waterfowl_district_clarification(question: str) -> AnswerOutcome:
+    species_terms = _extract_species_terms(question)
+    species_name = _pretty_species_name(next(iter(species_terms))) if species_terms else "waterfowl"
+    return _clarification_outcome(
+        f"Need one more detail for {species_name}: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "district",
+    )
+
+
 def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
     if _question_specifies_method(question):
         return False
@@ -878,11 +1263,26 @@ def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
         for document in documents
         if document.metadata.get("chunk_type") == "table_row" and document.metadata.get("table_context")
     }
-    return len(contexts) > 1
+    if len(contexts) > 1:
+        return True
 
+    if not _extract_district_terms(question):
+        districts = {document.metadata.get("district", "") for document in documents if document.metadata.get("district")}
+        if len(districts) > 1:
+            return True
+
+    return False
 
 
 def _ambiguity_clarification(question: str, documents: list[Document]) -> AnswerOutcome:
+    districts = {document.metadata.get("district", "") for document in documents if document.metadata.get("district")}
+    if len(districts) > 1 and not _extract_district_terms(question):
+        return _clarification_outcome(
+            "Your question matches multiple districts. Please ask again with one district: Hudson-James Bay District, Northern District, Central District, or Southern District. Informational only. Not legal advice. Verify current regs.",
+            question,
+            "district",
+        )
+
     contexts = [
         document.metadata.get("table_context", "")
         for document in documents
@@ -892,16 +1292,17 @@ def _ambiguity_clarification(question: str, documents: list[Document]) -> Answer
 
     if "bows only" in joined and "rifles, shotguns, muzzle-loading guns and bows" in joined:
         return _clarification_outcome(
-            "Your question matches multiple entries in the 2026 Summary. Reply with one: bows only, or guns. Informational only. Not legal advice. Verify current regs.",
+            "Your question matches multiple entries in the official summary. Reply with one: bows only, or guns. Informational only. Not legal advice. Verify current regs.",
             question,
             "method",
         )
 
     return _clarification_outcome(
-        "Your question matches multiple entries in the 2026 Summary. Please ask again with the hunting method or season type. Informational only. Not legal advice. Verify current regs.",
+        "Your question matches multiple entries. Please ask again with the missing district, hunting method, or season type. Informational only. Not legal advice. Verify current regs.",
         question,
-        "method",
+        "detail",
     )
+
 
 def _format_pages(documents: list[Document]) -> str:
     formatted_pages: list[dict[str, Any]] = []
@@ -910,8 +1311,12 @@ def _format_pages(documents: list[Document]) -> str:
             {
                 "page": document.metadata.get("page_num"),
                 "chunk_type": document.metadata.get("chunk_type"),
+                "source_title": document.metadata.get("source_title"),
+                "citation_url": document.metadata.get("citation_url"),
                 "url": document.metadata.get("url", PDF_URL),
                 "context": document.metadata.get("table_context", ""),
+                "district": document.metadata.get("district", ""),
+                "species": document.metadata.get("species", ""),
                 "text": _normalize_page_text(document.page_content),
             }
         )
@@ -939,6 +1344,11 @@ def answer_question_result(question: str) -> AnswerOutcome:
         _set_cached_answer(question, outcome)
         return outcome
 
+    if _waterfowl_district_missing(question):
+        outcome = _build_waterfowl_district_clarification(question)
+        _set_cached_answer(question, outcome)
+        return outcome
+
     vectorstore = _load_vectorstore()
     direct_matches = _direct_structured_match(vectorstore, question)
     if direct_matches:
@@ -951,6 +1361,7 @@ def answer_question_result(question: str) -> AnswerOutcome:
         retrieval_query = _rewrite_search_query(question)
         results = vectorstore.similarity_search(retrieval_query, k=8)
         results = _rerank_results(f"{question} {retrieval_query}", results)[:3]
+
     if _results_are_ambiguous(question, results):
         outcome = _ambiguity_clarification(question, results)
         _set_cached_answer(question, outcome)
@@ -959,6 +1370,7 @@ def answer_question_result(question: str) -> AnswerOutcome:
     prompt = SYSTEM_PROMPT.format(
         question=question,
         pages=_format_pages(results),
+        not_found_response=NOT_FOUND_RESPONSE,
     )
     response = _invoke_model_call(
         lambda: _get_chat_model().invoke(prompt),
@@ -969,7 +1381,7 @@ def answer_question_result(question: str) -> AnswerOutcome:
         _set_cached_answer(question, outcome)
         return outcome
     normalized = _normalize_model_output(response.content)
-    kind = "not_found" if normalized.startswith("Not found in 2026 Summary.") else "answer"
+    kind = "not_found" if normalized == NOT_FOUND_RESPONSE else "answer"
     outcome = AnswerOutcome(text=normalized, kind=kind)
     _set_cached_answer(question, outcome)
     return outcome

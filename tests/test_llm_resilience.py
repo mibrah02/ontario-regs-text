@@ -84,7 +84,7 @@ class LlmResilienceTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.15)
         self.assertEqual(result.kind, "not_found")
-        self.assertTrue(result.text.startswith("Not found in 2026 Summary."))
+        self.assertTrue(result.text.startswith("Not found in the official Ontario hunting or Ontario migratory bird summaries."))
 
     def test_specific_topic_question_overrides_topic_clarification(self) -> None:
         original_get_intake_model = rag_module._get_intake_model
@@ -197,7 +197,7 @@ class LlmResilienceTests(unittest.TestCase):
             main_module.build_sms_reply = original_build
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Not found in 2026 Summary.", response.text)
+        self.assertIn("Not found in the official Ontario hunting or Ontario migratory bird summaries.", response.text)
 
 
 if __name__ == "__main__":

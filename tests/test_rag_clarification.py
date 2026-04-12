@@ -48,6 +48,24 @@ class RagClarificationTests(unittest.TestCase):
         self.assertEqual(result.expected_detail, "topic")
         self.assertIn("deer season in WMU 65", result.text)
 
+    def test_can_i_hunt_rabbits_returns_natural_guidance(self) -> None:
+        result = answer_question_result("can I hunt rabbits in Ontario")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "topic")
+        self.assertIn("Rabbit hunting is covered here", result.text)
+
+    def test_duck_daily_limit_without_district_requests_district(self) -> None:
+        result = answer_question_result("duck daily limit")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "district")
+        self.assertIn("Southern District or Central District", result.text)
+
+    def test_duck_daily_limit_with_district_returns_federal_quote(self) -> None:
+        result = answer_question_result("duck daily limit in Southern District")
+        self.assertEqual(result.kind, "answer")
+        self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
+        self.assertIn("canada.ca/migratory-game-bird-hunting", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

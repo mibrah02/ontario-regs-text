@@ -72,16 +72,16 @@ class SmsGuidanceTests(unittest.TestCase):
         finally:
             main_module.increment_free_question_count = original_increment
 
-        self.assertIn("Ask an Ontario hunting regs question", reply)
+        self.assertIn("Ask an Ontario hunting question", reply)
         self.assertEqual(calls["count"], 0)
 
     def test_help_returns_guidance(self) -> None:
         reply = main_module.build_sms_reply("+16475550123", "help")
-        self.assertIn("exact quote from the 2026 Summary", reply)
+        self.assertIn("exact quote from the official summary", reply)
 
     def test_standalone_method_fragment_returns_guidance(self) -> None:
         reply = main_module.build_sms_reply("+16475550123", "guns")
-        self.assertIn("Ask an Ontario hunting regs question", reply)
+        self.assertIn("Ask an Ontario hunting question", reply)
 
     def test_pending_thanks_repeats_clarification(self) -> None:
         first = main_module.build_sms_reply(self.phone, "when is deer season")
@@ -103,7 +103,7 @@ class SmsGuidanceTests(unittest.TestCase):
         self.assertIn("p.44", answer)
         self.assertIsNone(get_pending_clarification(self.key))
         fresh = main_module.build_sms_reply(self.phone, "guns")
-        self.assertIn("Ask an Ontario hunting regs question", fresh)
+        self.assertIn("Ask an Ontario hunting question", fresh)
 
 
 if __name__ == "__main__":

@@ -31,10 +31,10 @@ from app.stripe import construct_event, get_checkout_url, handle_checkout_comple
 load_dotenv()
 
 FREE_QUESTION_LIMIT = 3
-NOT_FOUND_RESPONSE = "Not found in 2026 Summary. Check ontario.ca or call MNRF 1-800-667-1940. Info only. Not legal advice. Verify current regs."
+NOT_FOUND_RESPONSE = "Not found in the official Ontario hunting or Ontario migratory bird summaries. Check ontario.ca or canada.ca. Info only. Not legal advice. Verify current regs."
 GUIDANCE_RESPONSE = (
-    "Ask an Ontario hunting regs question, for example: hunter orange requirement, deer season WMU 65 bows only, or moose calf tag rules. "
-    "I reply with the exact quote from the 2026 Summary. Info only. Not legal advice. Verify current regs."
+    "Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. "
+    "I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs."
 )
 TEST_BYPASS_PHONE = os.getenv("TEST_BYPASS_PHONE", "+16472626664")
 PAYWALL_TEST_PREFIX = "PAYWALL "
@@ -135,20 +135,14 @@ def _estimate_sms_segments(text: str) -> int:
 
 def _answer_components(reply_text: str) -> tuple[str, str, str] | None:
     normalized = reply_text.strip()
-    prefix_marker = "2026 Ontario Hunting Regulations Summary, p."
-    suffix_marker = '" ontario.ca/hunting'
-    if not normalized.startswith(prefix_marker):
-        return None
     first_quote = normalized.find('"')
     last_quote = normalized.rfind('"')
     if first_quote == -1 or last_quote <= first_quote:
         return None
-    if suffix_marker not in normalized[last_quote:]:
-        return None
     prefix = normalized[:first_quote]
     quote = normalized[first_quote + 1:last_quote]
-    suffix = normalized[last_quote + 2:]
-    if not quote or not suffix.startswith("ontario.ca/hunting"):
+    suffix = normalized[last_quote + 2:].strip()
+    if ', p.' not in prefix or not quote or not suffix:
         return None
     return prefix, quote, suffix
 
