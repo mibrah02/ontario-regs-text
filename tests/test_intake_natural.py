@@ -94,5 +94,34 @@ class IntakeNaturalTests(unittest.TestCase):
         self.assertEqual(outcome.normalized_question, "duck daily limit Southern District WMU 65")
 
 
+    def test_extract_district_terms_infers_from_wmu(self) -> None:
+        self.assertEqual(rag._extract_district_terms("duck daily limit WMU 65"), {"Southern District"})
+
+    def test_extract_district_terms_infers_from_toronto(self) -> None:
+        self.assertEqual(rag._extract_district_terms("duck daily limit Toronto"), {"Southern District"})
+
+    def test_extract_district_terms_does_not_infer_from_ontario(self) -> None:
+        self.assertEqual(rag._extract_district_terms("duck daily limit in Ontario"), set())
+
+    def test_interpret_promotes_toronto_to_search_when_llm_over_clarifies_district(self) -> None:
+        original_invoke = rag._invoke_model_call
+        try:
+            rag._invoke_model_call = lambda callable_obj, timeout_seconds: SimpleNamespace(
+                content=json.dumps({
+                    "action": "clarify",
+                    "normalized_question": "",
+                    "reply_text": "Need one more detail: reply with the district, for example Southern or Central District.",
+                    "pending_question": "duck daily limit",
+                    "expected_detail": "district",
+                })
+            )
+            outcome = rag.interpret_incoming_message("duck daily limit Toronto")
+        finally:
+            rag._invoke_model_call = original_invoke
+
+        self.assertEqual(outcome.action, "search")
+        self.assertEqual(outcome.normalized_question, "duck daily limit Toronto")
+
+
 if __name__ == "__main__":
     unittest.main()

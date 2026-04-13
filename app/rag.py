@@ -136,6 +136,16 @@ DISTRICT_PATTERNS = {
     "southern": "Southern District",
     "south": "Southern District",
 }
+PLACE_TO_DISTRICT_PATTERNS = {
+    "toronto": "Southern District",
+    "gta": "Southern District",
+    "greater toronto": "Southern District",
+    "southern ontario": "Southern District",
+    "northern ontario": "Northern District",
+    "central ontario": "Central District",
+    "james bay": "Hudson-James Bay District",
+    "hudson bay": "Hudson-James Bay District",
+}
 
 SPECIES_PATTERNS = {
     "white-tailed deer": "deer",
@@ -387,9 +397,29 @@ def _extract_wmu_terms(question: str) -> set[str]:
     return {match.upper() for match in re.findall(r"\b(?:WMU\s*)?(\d{1,3}[A-Z]?)\b", question, re.IGNORECASE)}
 
 
+def _wmu_to_district_label(wmu: str) -> str | None:
+    match = re.match(r"(\d{1,3})", wmu)
+    if not match:
+        return None
+    number = int(match.group(1))
+    if 60 <= number <= 95:
+        return "Southern District"
+    if number in {42, 43, 44, 46, 47, 48, 49, 50, 53, 54, 55, 56, 57, 58, 59}:
+        return "Central District"
+    if 2 <= number <= 24 or 27 <= number <= 41 or number == 45:
+        return "Northern District"
+    return None
+
+
 def _extract_district_terms(question: str) -> set[str]:
     lowered = question.lower()
-    return {label for pattern, label in DISTRICT_PATTERNS.items() if pattern in lowered}
+    districts = {label for pattern, label in DISTRICT_PATTERNS.items() if pattern in lowered}
+    districts.update(label for pattern, label in PLACE_TO_DISTRICT_PATTERNS.items() if pattern in lowered)
+    for wmu in _extract_wmu_terms(question):
+        inferred = _wmu_to_district_label(wmu)
+        if inferred:
+            districts.add(inferred)
+    return districts
 
 
 def _extract_method_terms(question: str) -> set[str]:
@@ -1192,11 +1222,15 @@ def _merge_explicit_details(original_message: str, normalized_question: str) -> 
         preferred_species = next(iter(sorted(original_species)))
         merged = f"{preferred_species} {merged}".strip()
         merged_lower = merged.lower()
+        merged_species = _extract_species_terms(merged)
 
-    original_districts = _extract_district_terms(original)
-    if original_districts and not _extract_district_terms(merged):
-        merged = f"{merged} {next(iter(sorted(original_districts)))}".strip()
-        merged_lower = merged.lower()
+    all_species = set(original_species) | set(merged_species)
+    should_merge_district = bool(all_species.intersection(WATERFOWL_SPECIES))
+    if should_merge_district:
+        original_districts = _extract_district_terms(original)
+        if original_districts and not _extract_district_terms(merged):
+            merged = f"{merged} {next(iter(sorted(original_districts)))}".strip()
+            merged_lower = merged.lower()
 
     original_wmus = sorted(_extract_wmu_terms(original))
     if original_wmus and not _extract_wmu_terms(merged):
@@ -1275,6 +1309,13 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
         if action == "clarify" and stored_detail == "topic" and _message_has_specific_topic_hint(message):
             action = "search"
             normalized_question = message.strip()
+            reply_text = ""
+            stored_question = None
+            stored_detail = None
+
+        if action == "clarify" and stored_detail == "district" and _extract_district_terms(message):
+            action = "search"
+            normalized_question = normalized_question or message.strip()
             reply_text = ""
             stored_question = None
             stored_detail = None

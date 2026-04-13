@@ -80,5 +80,23 @@ class RagClarificationTests(unittest.TestCase):
         self.assertIn("6 (in WMUs 60 to 87E", result.text)
 
 
+    def test_duck_daily_limit_with_wmu_infers_district_and_returns_short_quote(self) -> None:
+        result = answer_question_result("duck daily limit WMU 65")
+        self.assertEqual(result.kind, "answer")
+        self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
+        self.assertIn("6 (in WMUs 60 to 87E", result.text)
+
+    def test_duck_daily_limit_with_toronto_infers_district_and_requests_wmu(self) -> None:
+        result = answer_question_result("duck daily limit Toronto")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "wmu")
+        self.assertIn("reply with your WMU", result.text)
+
+    def test_duck_daily_limit_with_ontario_stays_ambiguous(self) -> None:
+        result = answer_question_result("duck daily limit in Ontario")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "district")
+        self.assertIn("reply with the district", result.text)
+
 if __name__ == "__main__":
     unittest.main()
