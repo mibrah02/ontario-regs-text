@@ -37,6 +37,21 @@ def fake_interpret(question: str, pending_state: dict[str, str] | None = None) -
                 pending_question=pending_question,
                 expected_detail=detail,
             )
+        if expected_detail == "district" and text in {"southern", "southern district", "central", "central district", "northern", "northern district", "hudson-james", "hudson-james bay", "hudson-james bay district"}:
+            normalized = {
+                "southern": "Southern District",
+                "southern district": "Southern District",
+                "central": "Central District",
+                "central district": "Central District",
+                "northern": "Northern District",
+                "northern district": "Northern District",
+                "hudson-james": "Hudson-James Bay District",
+                "hudson-james bay": "Hudson-James Bay District",
+                "hudson-james bay district": "Hudson-James Bay District",
+            }[text]
+            return IntakeOutcome(action="search", normalized_question=f"{pending_question} {normalized}")
+        if expected_detail == "wmu" and text.startswith("wmu"):
+            return IntakeOutcome(action="search", normalized_question=f"{pending_question} {question.strip()}")
         if text == "bows only":
             return IntakeOutcome(action="search", normalized_question=f"{pending_question} bows only")
 
@@ -114,6 +129,21 @@ class SmsGuidanceTests(unittest.TestCase):
         reply = main_module.build_sms_reply(self.phone, "what can I hunt in Ontario")
         self.assertIn("Many species are covered", reply)
         self.assertIn("duck daily bag limit", reply)
+
+
+    def test_short_district_follow_up_requests_wmu_when_answer_is_too_long(self) -> None:
+        first = main_module.build_sms_reply(self.phone, "duck daily limit")
+        self.assertIn("reply with the district", first)
+        answer = main_module.build_sms_reply(self.phone, "Southern")
+        self.assertIn("reply with your WMU", answer)
+
+    def test_wmu_follow_up_after_district_returns_shorter_answer(self) -> None:
+        main_module.build_sms_reply(self.phone, "duck daily limit")
+        second = main_module.build_sms_reply(self.phone, "Southern")
+        self.assertIn("reply with your WMU", second)
+        third = main_module.build_sms_reply(self.phone, "WMU 65")
+        self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", third)
+        self.assertIn("WMUs 60 to 87E", third)
 
 
 if __name__ == "__main__":

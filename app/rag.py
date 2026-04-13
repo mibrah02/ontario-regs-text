@@ -122,9 +122,15 @@ MIGRATORY_DATA_LINE_RE = re.compile(
 DISTRICT_PATTERNS = {
     "hudson-james bay district": "Hudson-James Bay District",
     "hudson james bay district": "Hudson-James Bay District",
+    "hudson-james bay": "Hudson-James Bay District",
+    "hudson james bay": "Hudson-James Bay District",
+    "hudson-james": "Hudson-James Bay District",
     "northern district": "Northern District",
+    "northern": "Northern District",
     "central district": "Central District",
+    "central": "Central District",
     "southern district": "Southern District",
+    "southern": "Southern District",
 }
 
 SPECIES_PATTERNS = {
@@ -820,7 +826,7 @@ Examples:
 5. pending: none | message: "can I hunt rabbits in Ontario"
 {"action":"clarify","normalized_question":"","reply_text":"Rabbit hunting is covered here. Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in your WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
 6. pending: none | message: "duck daily limit"
-{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.","pending_question":"duck daily limit","expected_detail":"district"}
+{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with the district, for example Southern or Central District. Informational only. Not legal advice. Verify current regs.","pending_question":"duck daily limit","expected_detail":"district"}
 7. pending: none | message: "duck daily limit in Southern District"
 {"action":"search","normalized_question":"duck daily limit Southern District","reply_text":"","pending_question":"","expected_detail":""}
 8. pending: none | message: "guns"
@@ -881,7 +887,7 @@ def _clarification_reminder_text(expected_detail: str | None) -> str:
     if expected_detail == "wmu_and_method":
         return "Still need two details: reply with the WMU number and method, for example WMU 65 bows only. Informational only. Not legal advice. Verify current regs."
     if expected_detail == "district":
-        return "Still need one detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs."
+        return "Still need one detail: reply with the district, for example Southern or Central District. Informational only. Not legal advice. Verify current regs."
     if expected_detail == "topic":
         return "Please ask again with one specific topic, for example: daily limit, possession limit, season, tag, or hunter orange. Informational only. Not legal advice. Verify current regs."
     return "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
@@ -1025,7 +1031,7 @@ def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, 
     if any(species in species_terms for species in WATERFOWL_SPECIES) and any(term in lowered for term in WATERFOWL_DETAIL_TERMS) and not _extract_district_terms(lowered):
         return IntakeOutcome(
             action="clarify",
-            reply_text="Need one more detail: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.",
+            reply_text="Need one more detail: reply with the district, for example Southern or Central District. Informational only. Not legal advice. Verify current regs.",
             pending_question=message.strip(),
             expected_detail="district",
         )
@@ -1301,7 +1307,7 @@ def _build_waterfowl_district_clarification(question: str) -> AnswerOutcome:
     species_terms = _extract_species_terms(question)
     species_name = _pretty_species_name(next(iter(species_terms))) if species_terms else "waterfowl"
     return _clarification_outcome(
-        f"Need one more detail for {species_name}: reply with the district, for example Southern District or Central District. Informational only. Not legal advice. Verify current regs.",
+        f"Need one more detail for {species_name}: reply with the district, for example Southern or Central District. Informational only. Not legal advice. Verify current regs.",
         question,
         "district",
     )

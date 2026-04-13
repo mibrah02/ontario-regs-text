@@ -147,12 +147,76 @@ def _answer_components(reply_text: str) -> tuple[str, str, str] | None:
     return prefix, quote, suffix
 
 
+def _question_has_wmu(question: str) -> bool:
+    lowered = question.lower()
+    return "wmu" in lowered or bool(re.search(r"\d{1,3}[A-Z]?", question, re.IGNORECASE))
+
+
+def _oversize_answer_fallback(question: str, reply_text: str) -> str | None:
+    lowered = question.lower()
+    if not any(term in lowered for term in ("daily", "bag", "limit", "possession")):
+        return None
+    lowered_reply = reply_text.lower()
+    if "district" in lowered_reply and "wmu" in lowered_reply and not _question_has_wmu(question):
+        return "Need one more detail for the exact limit: reply with your WMU, for example WMU 65. Informational only. Not legal advice. Verify current regs."
+    return None
+
+
 def _question_keywords(question: str) -> set[str]:
     return {
         word
         for word in re.findall(r"[a-z0-9]+", question.lower())
         if len(word) >= 4 and word not in STOPWORDS
     }
+
+
+def _extract_first_wmu(question: str) -> str | None:
+    match = re.search(r"(?:WMU\s*)?(\d{1,3}[A-Z]?)", question, re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def _wmu_in_group(target_wmu: str, group: str) -> bool:
+    target_match = re.match(r"(\d{1,3})", target_wmu)
+    if not target_match:
+        return False
+    target_num = int(target_match.group(1))
+    for start, end in re.findall(r"(\d{1,3})\s+to\s+(\d{1,3})[A-Z]?", group, re.IGNORECASE):
+        if int(start) <= target_num <= int(end):
+            return True
+    for single in re.findall(r"(\d{1,3})[A-Z]?", group):
+        if int(single) == target_num:
+            return True
+    return False
+
+
+def _shorten_migratory_limit_quote(question: str, quote: str) -> str | None:
+    lowered = question.lower()
+    if not any(term in lowered for term in ("daily", "bag", "limit")):
+        return None
+    if "district" not in quote.lower():
+        return None
+
+    season_match = re.search(
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:\s+to\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2})?",
+        quote,
+        re.IGNORECASE,
+    )
+    start_index = season_match.end() if season_match else 0
+    quantity_matches = list(re.finditer(r"(?:No limit|N/A|\d{1,2})(?:\s*\([^)]*\))?", quote[start_index:]))
+    if not quantity_matches:
+        return None
+    prefix = quote[: start_index].strip() if start_index else quote[: quantity_matches[0].start()].strip()
+    groups = [match.group(0).strip() for match in quantity_matches]
+    target_wmu = _extract_first_wmu(question)
+    kept: list[str] = []
+    if target_wmu:
+        kept = [group for group in groups if _wmu_in_group(target_wmu, group)]
+        if kept:
+            kept = kept[:1]
+    if not kept:
+        kept = groups[::2] or groups[:1]
+    candidate = f"{prefix} {' '.join(kept)}".strip()
+    return candidate if candidate and candidate != quote else None
 
 
 def _trim_fragment_to_relevant_start(question: str, fragment: str) -> str:
@@ -178,6 +242,10 @@ def _trim_fragment_to_relevant_start(question: str, fragment: str) -> str:
 
 
 def _shorten_answer_quote(question: str, quote: str) -> str:
+    migratory_short = _shorten_migratory_limit_quote(question, quote)
+    if migratory_short:
+        return migratory_short
+
     keywords = _question_keywords(question)
     if not keywords:
         return quote.strip()
@@ -207,7 +275,8 @@ def _fit_reply_to_sms_limit(question: str, reply_text: str) -> str:
 
     parts = _answer_components(normalized)
     if not parts:
-        return normalized
+        fallback = _oversize_answer_fallback(question, normalized)
+        return _normalize_sms_transport(fallback) if fallback else normalized
 
     prefix, quote, suffix = parts
     shortened_quote = _shorten_answer_quote(question, quote)
@@ -221,6 +290,10 @@ def _fit_reply_to_sms_limit(question: str, reply_text: str) -> str:
             fallback = _normalize_sms_transport(f'{prefix}"{first_sentence}." {suffix}')
             if _estimate_sms_segments(fallback) <= SMS_SEGMENT_LIMIT:
                 return fallback
+
+    oversize_fallback = _oversize_answer_fallback(question, candidate)
+    if oversize_fallback:
+        return _normalize_sms_transport(oversize_fallback)
 
     return candidate
 
@@ -301,14 +374,26 @@ def build_sms_reply(from_number: str, question: str) -> str:
     clear_pending_clarification(_normalize_phone(from_number))
 
     if _is_test_bypass_number(from_number):
-        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
+        answer_text = _safe_answer(from_number, search_question)
+        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
+        if "reply with your WMU" in fitted:
+            set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
+        return fitted
 
     if _is_seeded_paid_number(from_number) or is_paid_user(from_number):
-        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
+        answer_text = _safe_answer(from_number, search_question)
+        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
+        if "reply with your WMU" in fitted:
+            set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
+        return fitted
 
     free_count = increment_free_question_count(_normalize_phone(from_number))
     if free_count <= FREE_QUESTION_LIMIT:
-        return _fit_reply_to_sms_limit(question, _safe_answer(from_number, search_question))
+        answer_text = _safe_answer(from_number, search_question)
+        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
+        if "reply with your WMU" in fitted:
+            set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
+        return fitted
 
     try:
         get_checkout_url(from_number)

@@ -58,13 +58,18 @@ class RagClarificationTests(unittest.TestCase):
         result = answer_question_result("duck daily limit")
         self.assertEqual(result.kind, "clarify")
         self.assertEqual(result.expected_detail, "district")
-        self.assertIn("Southern District or Central District", result.text)
+        self.assertIn("Southern or Central District", result.text)
 
     def test_duck_daily_limit_with_district_returns_federal_quote(self) -> None:
         result = answer_question_result("duck daily limit in Southern District")
         self.assertEqual(result.kind, "answer")
         self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
         self.assertIn("canada.ca/migratory-game-bird-hunting", result.text)
+
+    def test_duck_daily_limit_with_short_district_returns_federal_quote(self) -> None:
+        result = answer_question_result("duck daily limit Southern")
+        self.assertEqual(result.kind, "answer")
+        self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
 
 
 if __name__ == "__main__":
