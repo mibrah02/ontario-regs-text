@@ -228,7 +228,7 @@ def _trim_fragment_to_relevant_start(question: str, fragment: str) -> str:
     if "season" in lowered_question:
         priority_phrases.extend(["open season", "season"])
     if "orange" in lowered_question:
-        priority_phrases.append("orange")
+        priority_phrases.extend(["hunter orange", "fluorescent orange"])
     if "tag" in lowered_question:
         priority_phrases.append("tag")
     if "wmu" in lowered_question:

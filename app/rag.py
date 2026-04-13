@@ -125,12 +125,16 @@ DISTRICT_PATTERNS = {
     "hudson-james bay": "Hudson-James Bay District",
     "hudson james bay": "Hudson-James Bay District",
     "hudson-james": "Hudson-James Bay District",
+    "north district": "Northern District",
     "northern district": "Northern District",
     "northern": "Northern District",
+    "north": "Northern District",
     "central district": "Central District",
     "central": "Central District",
+    "south district": "Southern District",
     "southern district": "Southern District",
     "southern": "Southern District",
+    "south": "Southern District",
 }
 
 SPECIES_PATTERNS = {
@@ -886,6 +890,8 @@ Rules:
 - Use action=search when the user asked a specific hunting-regs question, even if phrasing is messy.
 - Use action=guide for greetings, chit-chat, or messages with no usable hunting-regs question.
 - Use action=clarify when the message is hunting-related but still missing an important detail.
+- Treat telegraphic shorthand, broken grammar, omitted verbs, and cave-man style phrasing as normal user intent.
+- Preserve concrete details the user already gave, like species, WMU, district, method, season, tag, orange, or limit.
 - If pending context exists and the new message clearly starts a new question, ignore the pending context.
 - If pending context exists and the new message fills the missing detail, combine it and use action=search.
 - If pending context exists and the new message is meta, confusion, or acknowledgement, use action=clarify and repeat the missing detail briefly.
@@ -911,6 +917,14 @@ Examples:
 {"action":"search","normalized_question":"duck daily limit Southern District","reply_text":"","pending_question":"","expected_detail":""}
 8. pending: none | message: "guns"
 {"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
+9. pending: none | message: "deer 65 when"
+{"action":"search","normalized_question":"when is deer season in WMU 65","reply_text":"","pending_question":"","expected_detail":""}
+10. pending: none | message: "season deer 65 bow"
+{"action":"search","normalized_question":"when is deer season in WMU 65 bows only","reply_text":"","pending_question":"","expected_detail":""}
+11. pending: none | message: "duck limit south 65"
+{"action":"search","normalized_question":"duck daily limit Southern District WMU 65","reply_text":"","pending_question":"","expected_detail":""}
+12. pending: none | message: "orange?"
+{"action":"search","normalized_question":"hunter orange requirement","reply_text":"","pending_question":"","expected_detail":""}
 
 Pending question: {pending_question}
 Expected detail: {expected_detail}
@@ -971,6 +985,22 @@ def _clarification_reminder_text(expected_detail: str | None) -> str:
     if expected_detail == "topic":
         return "Please ask again with one specific topic, for example: daily limit, possession limit, season, tag, or hunter orange. Informational only. Not legal advice. Verify current regs."
     return "Still need one detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs."
+
+
+def _is_orphan_fragment(message: str) -> bool:
+    lowered = message.lower().strip()
+    species_terms = _extract_species_terms(message)
+    if species_terms:
+        return False
+    words = re.findall(r"\w+", lowered)
+    if len(words) > 3:
+        return False
+    has_fragment_detail = _question_specifies_method(lowered) or bool(_extract_wmu_terms(lowered)) or bool(_extract_district_terms(lowered))
+    if not has_fragment_detail:
+        return False
+    if any(term in lowered for term in ("season", "limit", "daily", "bag", "possession", "tag", "orange", "license", "licence")):
+        return False
+    return True
 
 
 def _looks_like_follow_up_fragment(message: str, expected_detail: str | None) -> bool:
@@ -1085,7 +1115,7 @@ def _deterministic_intake_outcome(message: str, pending_state: dict[str, str] | 
             combined = f"{pending_question} {message.strip()}".strip()
             return IntakeOutcome(action="search", normalized_question=combined)
 
-    if not pending_question and len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized)) or bool(_extract_district_terms(normalized))):
+    if not pending_question and _is_orphan_fragment(message):
         return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
 
     return None
@@ -1117,7 +1147,7 @@ def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, 
     if not normalized:
         return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
 
-    if len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized)) or bool(_extract_district_terms(normalized))):
+    if _is_orphan_fragment(message):
         return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
 
     species_terms = _extract_species_terms(message)
@@ -1148,6 +1178,42 @@ def _strip_json_fence(text: str) -> str:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def _merge_explicit_details(original_message: str, normalized_question: str) -> str:
+    original = original_message.strip()
+    merged = normalized_question.strip() or original
+    original_lower = original.lower()
+    merged_lower = merged.lower()
+
+    original_species = _extract_species_terms(original)
+    merged_species = _extract_species_terms(merged)
+    if original_species and not merged_species:
+        preferred_species = next(iter(sorted(original_species)))
+        merged = f"{preferred_species} {merged}".strip()
+        merged_lower = merged.lower()
+
+    original_districts = _extract_district_terms(original)
+    if original_districts and not _extract_district_terms(merged):
+        merged = f"{merged} {next(iter(sorted(original_districts)))}".strip()
+        merged_lower = merged.lower()
+
+    original_wmus = sorted(_extract_wmu_terms(original))
+    if original_wmus and not _extract_wmu_terms(merged):
+        merged = f"{merged} WMU {original_wmus[0]}".strip()
+        merged_lower = merged.lower()
+
+    if _question_specifies_method(original) and not _question_specifies_method(merged):
+        if "bow" in original_lower:
+            merged = f"{merged} bows only".strip()
+        elif any(term in original_lower for term in ("rifle", "rifles", "shotgun", "shotguns", "muzzle", "muzzle-loading", "gun", "guns")):
+            merged = f"{merged} guns".strip()
+        merged_lower = merged.lower()
+
+    if "orange" in original_lower and "orange" not in merged_lower:
+        merged = f"{merged} hunter orange".strip()
+
+    return re.sub(r"\s+", " ", merged).strip()
 
 
 def interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
@@ -1183,6 +1249,8 @@ def interpret_incoming_message(message: str, pending_state: dict[str, str] | Non
 
         if action == "search" and not normalized_question:
             normalized_question = message.strip()
+        if action == "search":
+            normalized_question = _merge_explicit_details(message, normalized_question)
         if action in {"guide", "clarify"} and not reply_text:
             raise ValueError("Missing reply_text for non-search action")
 
