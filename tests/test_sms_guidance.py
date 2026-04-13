@@ -67,10 +67,13 @@ class SmsGuidanceTests(unittest.TestCase):
         self.key = main_module._normalize_phone(self.phone)
         clear_pending_clarification(self.key)
         self.original_interpret = main_module.interpret_incoming_message
+        self.original_render = main_module.render_interaction_text
         main_module.interpret_incoming_message = fake_interpret
+        main_module.render_interaction_text = lambda user_message, interaction_kind, fallback_text, pending_question=None, expected_detail=None: fallback_text
 
     def tearDown(self) -> None:
         main_module.interpret_incoming_message = self.original_interpret
+        main_module.render_interaction_text = self.original_render
         clear_pending_clarification(self.key)
 
     def test_hello_returns_guidance_without_counting_usage(self) -> None:
@@ -93,6 +96,12 @@ class SmsGuidanceTests(unittest.TestCase):
     def test_help_returns_guidance(self) -> None:
         reply = main_module.build_sms_reply("+16475550123", "help")
         self.assertIn("exact quote from the official summary", reply)
+
+    def test_pending_hello_resets_to_guidance(self) -> None:
+        main_module.build_sms_reply(self.phone, "can I hunt rabbits in Ontario")
+        reply = main_module.build_sms_reply(self.phone, "hello")
+        self.assertIn("Ask an Ontario hunting question", reply)
+        self.assertIsNone(get_pending_clarification(self.key))
 
     def test_standalone_method_fragment_returns_guidance(self) -> None:
         reply = main_module.build_sms_reply("+16475550123", "guns")

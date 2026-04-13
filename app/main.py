@@ -24,7 +24,7 @@ from app.db import (
     mark_event_processed,
     set_pending_clarification,
 )
-from app.rag import AnswerOutcome, IntakeOutcome, answer_question_result, ensure_index, interpret_incoming_message
+from app.rag import AnswerOutcome, IntakeOutcome, answer_question_result, ensure_index, interpret_incoming_message, render_interaction_text
 from app.stripe import construct_event, get_checkout_url, handle_checkout_completed
 
 
@@ -346,13 +346,13 @@ def _safe_intake(question: str, pending_state: dict[str, str] | None) -> IntakeO
         return IntakeOutcome(action="search", normalized_question=question)
 
 
-def _safe_answer(from_number: str, question: str) -> str:
+def _safe_answer_outcome(from_number: str, question: str) -> AnswerOutcome:
     try:
         outcome = answer_question_result(question)
     except Exception:
         outcome = AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
     _track_clarification(from_number, outcome)
-    return outcome.text
+    return outcome
 
 
 def build_sms_reply(from_number: str, question: str) -> str:
@@ -368,32 +368,43 @@ def build_sms_reply(from_number: str, question: str) -> str:
 
     if intake.action in {"guide", "clarify"}:
         _track_intake(from_number, intake)
-        return _fit_reply_to_sms_limit(question, intake.reply_text or GUIDANCE_RESPONSE)
+        interaction_text = render_interaction_text(
+            question,
+            intake.action,
+            intake.reply_text or GUIDANCE_RESPONSE,
+            pending_question=intake.pending_question,
+            expected_detail=intake.expected_detail,
+        )
+        return _fit_reply_to_sms_limit(question, interaction_text)
 
     search_question = intake.normalized_question or question
     clear_pending_clarification(_normalize_phone(from_number))
 
-    if _is_test_bypass_number(from_number):
-        answer_text = _safe_answer(from_number, search_question)
-        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
-        if "reply with your WMU" in fitted:
+    def answer_reply() -> str:
+        outcome = _safe_answer_outcome(from_number, search_question)
+        reply_text = outcome.text
+        if outcome.kind == "clarify":
+            reply_text = render_interaction_text(
+                question,
+                "clarify",
+                outcome.text,
+                pending_question=outcome.pending_question,
+                expected_detail=outcome.expected_detail,
+            )
+        fitted_reply = _fit_reply_to_sms_limit(search_question, reply_text)
+        if "reply with your WMU" in fitted_reply:
             set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
-        return fitted
+        return fitted_reply
+
+    if _is_test_bypass_number(from_number):
+        return answer_reply()
 
     if _is_seeded_paid_number(from_number) or is_paid_user(from_number):
-        answer_text = _safe_answer(from_number, search_question)
-        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
-        if "reply with your WMU" in fitted:
-            set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
-        return fitted
+        return answer_reply()
 
     free_count = increment_free_question_count(_normalize_phone(from_number))
     if free_count <= FREE_QUESTION_LIMIT:
-        answer_text = _safe_answer(from_number, search_question)
-        fitted = _fit_reply_to_sms_limit(search_question, answer_text)
-        if "reply with your WMU" in fitted:
-            set_pending_clarification(_normalize_phone(from_number), _serialize_pending_state(search_question, "wmu"))
-        return fitted
+        return answer_reply()
 
     try:
         get_checkout_url(from_number)

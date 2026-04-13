@@ -900,10 +900,31 @@ def _rerank_results(question: str, documents: list[Document]) -> list[Document]:
     return sorted(documents, key=sort_key, reverse=True)
 
 
+INTERACTION_DISCLAIMER = "Info only. Not legal advice. Verify current regs."
 INTAKE_GUIDANCE_RESPONSE = (
     "Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. "
-    "I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs."
+    f"I reply with the exact quote from the official summary. {INTERACTION_DISCLAIMER}"
 )
+
+INTERACTION_RENDER_PROMPT = """You write outgoing non-answer SMS replies for Ontario Regs Text.
+These messages do not answer the regulation question. They only guide the user or ask for one missing detail so the system can later send an exact quote from the official summary.
+Write one short natural SMS in plain ASCII.
+Sound like a helpful person, not a rule engine.
+Treat shorthand, broken grammar, and cave-man phrasing as normal.
+Ask only for what is actually missing.
+If the user was too broad, guide them toward one specific question.
+If geography is too broad, ask naturally where in Ontario. A city, district, or WMU is acceptable when relevant.
+Do not quote regulations. Do not mention internal labels like expected_detail.
+Keep it brief enough for SMS.
+End with exactly: "Info only. Not legal advice. Verify current regs."
+Return only the SMS text.
+
+Interaction kind: {interaction_kind}
+User message: {user_message}
+Current interpreted question: {pending_question}
+Missing detail: {expected_detail}
+Internal fallback intent: {fallback_text}
+"""
 
 INTAKE_PROMPT = """You are the intake layer for Ontario Regs Text, an SMS bot that answers Ontario hunting regulation questions.
 Your job is only to understand the user's message and choose the next step.
@@ -926,23 +947,23 @@ Rules:
 - If pending context exists and the new message fills the missing detail, combine it and use action=search.
 - If pending context exists and the new message is meta, confusion, or acknowledgement, use action=clarify and repeat the missing detail briefly.
 - For broad supported-species questions like "can I hunt rabbits in Ontario", keep it natural: you may briefly confirm the species is covered in the official summaries, then ask for one specific question.
-- For waterfowl season or limit questions without a district, ask for the district: Hudson-James Bay, Northern, Central, or Southern.
-- Keep reply_text short and natural for SMS.
+- For waterfowl season or limit questions without enough geography, ask naturally where in Ontario. A city, district, or WMU is acceptable when it helps identify the district.
+- Keep reply_text short and natural for SMS. Sound like a person, not a form.
 - Never answer from memory and never quote regulations yourself.
 
 Examples:
 1. pending: none | message: "hello"
 {"action":"guide","normalized_question":"","reply_text":"Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs.","pending_question":"","expected_detail":""}
 2. pending: {"question":"when is deer season","expected_detail":"wmu_and_method"} | message: "WMU 65"
-{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with bows only, or guns. Informational only. Not legal advice. Verify current regs.","pending_question":"when is deer season in WMU 65","expected_detail":"method"}
+{"action":"clarify","normalized_question":"","reply_text":"Got the WMU. One more thing: bows only, or guns? Info only. Not legal advice. Verify current regs.","pending_question":"when is deer season in WMU 65","expected_detail":"method"}
 3. pending: {"question":"when is deer season in WMU 65","expected_detail":"method"} | message: "bows only"
 {"action":"search","normalized_question":"when is deer season in WMU 65 bows only","reply_text":"","pending_question":"","expected_detail":""}
 4. pending: none | message: "what rabbits hunting rules"
-{"action":"clarify","normalized_question":"","reply_text":"Rabbit hunting is covered here. Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in your WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
+{"action":"clarify","normalized_question":"","reply_text":"Yes, rabbit hunting is covered here. What rabbit question do you want, like daily limit, season, or possession limit? Info only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
 5. pending: none | message: "can I hunt rabbits in Ontario"
-{"action":"clarify","normalized_question":"","reply_text":"Rabbit hunting is covered here. Ask one specific rabbit question, for example: rabbit daily limit, rabbit possession limit, or rabbit season in your WMU. Informational only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
+{"action":"clarify","normalized_question":"","reply_text":"Yes, rabbit hunting is covered here. What rabbit question do you want, like daily limit, season, or possession limit? Info only. Not legal advice. Verify current regs.","pending_question":"rabbit","expected_detail":"topic"}
 6. pending: none | message: "duck daily limit"
-{"action":"clarify","normalized_question":"","reply_text":"Need one more detail: reply with the district, for example Southern or Central District. Informational only. Not legal advice. Verify current regs.","pending_question":"duck daily limit","expected_detail":"district"}
+{"action":"clarify","normalized_question":"","reply_text":"Which part of Ontario? A city, district, or WMU is enough. Info only. Not legal advice. Verify current regs.","pending_question":"duck daily limit","expected_detail":"district"}
 7. pending: none | message: "duck daily limit in Southern District"
 {"action":"search","normalized_question":"duck daily limit Southern District","reply_text":"","pending_question":"","expected_detail":""}
 8. pending: none | message: "guns"
@@ -1133,6 +1154,9 @@ def _deterministic_intake_outcome(message: str, pending_state: dict[str, str] | 
     pending_question = (pending_state or {}).get("question", "").strip()
     expected_detail = (pending_state or {}).get("expected_detail", "").strip() or None
 
+    if normalized in {"hi", "hello", "hey", "help", "start", "menu", "info", "usage", "how do i use this", "how to use this", "what can you do", "what do you do"}:
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
     if pending_question:
         if normalized in {"thanks", "thank you", "thx", "ok", "okay", "cool", "got it", "lol", "haha", "what do you mean", "which one", "can you clarify", "clarify", "not sure", "i dont know", "i do not know"}:
             return IntakeOutcome(
@@ -1208,6 +1232,50 @@ def _strip_json_fence(text: str) -> str:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def _ensure_interaction_disclaimer(text: str) -> str:
+    normalized = _normalize_inline(text)
+    normalized = re.sub(
+        r"(?:Informational only|Info only)\. Not legal advice\. Verify current regs\.$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not normalized:
+        return INTERACTION_DISCLAIMER
+    if normalized[-1] not in ".!?":
+        normalized = f"{normalized}."
+    return f"{normalized} {INTERACTION_DISCLAIMER}".strip()
+
+
+def render_interaction_text(
+    user_message: str,
+    interaction_kind: str,
+    fallback_text: str,
+    pending_question: str | None = None,
+    expected_detail: str | None = None,
+) -> str:
+    fallback = _ensure_interaction_disclaimer(fallback_text or INTAKE_GUIDANCE_RESPONSE)
+    prompt = INTERACTION_RENDER_PROMPT.format(
+        interaction_kind=interaction_kind or "clarify",
+        user_message=_normalize_inline(user_message),
+        pending_question=_normalize_inline(pending_question or "none"),
+        expected_detail=_normalize_inline(expected_detail or "none"),
+        fallback_text=fallback,
+    )
+    try:
+        response = _invoke_model_call(
+            lambda: _get_intake_model().invoke(prompt),
+            INTAKE_TIMEOUT_SECONDS,
+        )
+        if response is None:
+            return fallback
+        rendered = _strip_json_fence(str(response.content))
+        rendered = _ensure_interaction_disclaimer(rendered)
+        return rendered or fallback
+    except Exception:
+        return fallback
 
 
 def _merge_explicit_details(original_message: str, normalized_question: str) -> str:
