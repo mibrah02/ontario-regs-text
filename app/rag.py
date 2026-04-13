@@ -29,14 +29,16 @@ FEDERAL_WATERFOWL_PDF_PATH = Path(os.getenv("FEDERAL_WATERFOWL_PDF_PATH", "data/
 INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", "data"))
 NOT_FOUND_RESPONSE = (
     "Not found in the official Ontario hunting or Ontario migratory bird summaries. Check ontario.ca or canada.ca. "
-    "Informational only. Not legal advice. Verify current regs."
+    "Verify current regs."
 )
 INTAKE_MODEL = os.getenv("INTAKE_MODEL", "gpt-4o-mini")
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gpt-4o-mini")
 ANSWER_MODEL = os.getenv("ANSWER_MODEL", "gpt-4o")
+RESPONSE_MODEL = os.getenv("RESPONSE_MODEL", INTAKE_MODEL)
 INTAKE_TIMEOUT_SECONDS = float(os.getenv("INTAKE_TIMEOUT_SECONDS", "3.5"))
 REWRITE_TIMEOUT_SECONDS = float(os.getenv("REWRITE_TIMEOUT_SECONDS", "2.5"))
 ANSWER_TIMEOUT_SECONDS = float(os.getenv("ANSWER_TIMEOUT_SECONDS", "5.5"))
+RESPONSE_TIMEOUT_SECONDS = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "3.0"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
 MODEL_CALL_WORKERS = max(2, int(os.getenv("MODEL_CALL_WORKERS", "4")))
 MODEL_CALL_POOL = ThreadPoolExecutor(max_workers=MODEL_CALL_WORKERS)
@@ -53,10 +55,24 @@ If the source is a table, return only the exact matching row or cell text needed
 Use the provided table context, district, WMU, and method context to distinguish between different entries.
 Preserve source wording, but collapse repeated spaces and line breaks into normal readable spaces.
 Reply with EXACTLY this format:
-'{{source_title}}, p.{{page}}: "{{exact sentence from PDF}}" {{citation_url}}
-Informational only. Not legal advice. Verify current regs.'
+'{{source_title}}, p.{{page}}: "{{exact sentence from PDF}}" {{citation_url}}'
 If not found, reply: '{not_found_response}'
 Do not add anything else."""
+FINAL_RESPONSE_PROMPT = """You write the final outgoing SMS answer for Ontario Regs Text.
+Use the exact quote exactly as provided between double quotes. Do not change any word inside the quote.
+You may add a short natural lead-in before the quote and a short citation after it.
+Keep it concise and readable for SMS.
+You must include the exact quote, the page number as p.{page}, and the citation URL {citation_url}.
+Do not say "not legal advice".
+End with exactly: "Verify current regs."
+Return only the SMS text.
+
+User question: {question}
+Source title: {source_title}
+Page: {page}
+Citation URL: {citation_url}
+Exact quote: "{exact_quote}"
+"""
 SEARCH_REWRITE_PROMPT = """Rewrite the user question into a short search query for the official Ontario hunting and Ontario migratory bird summaries.
 Keep species names, WMU numbers, districts, season concepts, licence concepts, and gear terms when relevant.
 Do not answer the question. Do not add commentary. Return one short search query only.
@@ -204,6 +220,15 @@ def _get_chat_model() -> ChatOpenAI:
     )
 
 
+def _get_response_model() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=RESPONSE_MODEL,
+        temperature=0,
+        timeout=RESPONSE_TIMEOUT_SECONDS,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+
+
 def _get_intake_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=INTAKE_MODEL,
@@ -260,6 +285,28 @@ def _normalize_question_cache_key(question: str) -> str:
     return lowered.strip()
 
 
+def _ensure_final_footer(text: str) -> str:
+    normalized = _normalize_inline(text)
+    normalized = re.sub(
+        r"(?:Informational only|Info only)\. Not legal advice\. Verify current regs\.$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"(?:Informational only|Info only)\. Verify current regs\.$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"Verify current regs\.$", "", normalized, flags=re.IGNORECASE).strip()
+    if not normalized:
+        return "Verify current regs."
+    if normalized[-1] not in ".!?":
+        normalized = f"{normalized}."
+    return f"{normalized} Verify current regs."
+
+
 def _prune_answer_cache(now: float) -> None:
     expired = [key for key, (expires_at, _) in ANSWER_CACHE.items() if expires_at <= now]
     for key in expired:
@@ -286,6 +333,14 @@ class IntakeOutcome:
     reply_text: str = ""
     pending_question: str | None = None
     expected_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class QuotePayload:
+    source_title: str
+    page: str
+    citation_url: str
+    exact_quote: str
 
 
 def _get_cached_answer(question: str):
@@ -343,38 +398,67 @@ def _compress_repeated_table_row(text: str) -> str:
     return f"{prefix} {' '.join(tokens[:midpoint])}".strip()
 
 
-def _format_exact_quote(document: Document) -> str:
-    page = document.metadata.get("page_num", "?")
+def _quote_payload_from_document(document: Document, question: str | None = None) -> QuotePayload:
+    page = str(document.metadata.get("page_num", "?"))
     quote = _normalize_inline(document.page_content)
     if document.metadata.get("chunk_type") == "table_row":
         quote = _compress_repeated_table_row(quote)
-    quote = quote.replace('"', '\\"')
-    source_title = document.metadata.get("source_title", "Official Hunting Summary")
-    citation_url = document.metadata.get("citation_url", PROVINCIAL_CITATION_URL)
-    return (
-        f'{source_title}, p.{page}: "{quote}" {citation_url}\n'
-        "Informational only. Not legal advice. Verify current regs."
-    )
-
-
-def _format_exact_quote_for_question(document: Document, question: str) -> str:
-    page = document.metadata.get("page_num", "?")
-    quote = _normalize_inline(document.page_content)
-    if document.metadata.get("chunk_type") == "table_row":
-        quote = _compress_repeated_table_row(quote)
-
-    if document.metadata.get("source_kind") == "migratory":
+    if question and document.metadata.get("source_kind") == "migratory":
         narrowed_quote = _extract_migratory_limit_quote_for_question(question, quote)
         if narrowed_quote:
             quote = narrowed_quote
-
-    quote = quote.replace('"', '\\"')
-    source_title = document.metadata.get("source_title", "Official Hunting Summary")
-    citation_url = document.metadata.get("citation_url", PROVINCIAL_CITATION_URL)
-    return (
-        f'{source_title}, p.{page}: "{quote}" {citation_url}\n'
-        "Informational only. Not legal advice. Verify current regs."
+    return QuotePayload(
+        source_title=str(document.metadata.get("source_title", "Official Hunting Summary")),
+        page=page,
+        citation_url=str(document.metadata.get("citation_url", PROVINCIAL_CITATION_URL)),
+        exact_quote=quote,
     )
+
+
+def _parse_exact_quote_payload(reply_text: str) -> QuotePayload | None:
+    normalized = _normalize_model_output(reply_text)
+    match = re.match(r'^(?P<source>.+?), p\.(?P<page>[^:]+): "(?P<quote>.+)" (?P<url>\S+)$', normalized, re.DOTALL)
+    if not match:
+        return None
+    return QuotePayload(
+        source_title=match.group("source").strip(),
+        page=match.group("page").strip(),
+        citation_url=match.group("url").strip(),
+        exact_quote=match.group("quote").strip(),
+    )
+
+
+def _deterministic_final_answer(payload: QuotePayload) -> str:
+    quote = payload.exact_quote.replace('"', '\"')
+    return _ensure_final_footer(
+        f'The summary says: "{quote}" ({payload.source_title}, p.{payload.page}, {payload.citation_url}).'
+    )
+
+
+def _render_final_answer(question: str, payload: QuotePayload) -> str:
+    fallback = _deterministic_final_answer(payload)
+    prompt = FINAL_RESPONSE_PROMPT.format(
+        question=_normalize_inline(question),
+        source_title=payload.source_title,
+        page=payload.page,
+        citation_url=payload.citation_url,
+        exact_quote=payload.exact_quote.replace('"', '\"'),
+    )
+    try:
+        response = _invoke_model_call(
+            lambda: _get_response_model().invoke(prompt),
+            RESPONSE_TIMEOUT_SECONDS,
+        )
+        if response is None:
+            return fallback
+        rendered = _ensure_final_footer(str(response.content))
+        if payload.exact_quote not in rendered:
+            return fallback
+        if f'p.{payload.page}' not in rendered or payload.citation_url not in rendered:
+            return fallback
+        return rendered
+    except Exception:
+        return fallback
 
 
 def _extract_species_terms(question: str) -> set[str]:
@@ -1711,7 +1795,8 @@ def answer_question_result(question: str) -> AnswerOutcome:
                 outcome = _build_waterfowl_wmu_clarification(question)
                 _set_cached_answer(question, outcome)
                 return outcome
-            outcome = AnswerOutcome(text=_format_exact_quote_for_question(direct_match, question), kind="answer")
+            payload = _quote_payload_from_document(direct_match, question)
+            outcome = AnswerOutcome(text=_render_final_answer(question, payload), kind="answer")
             _set_cached_answer(question, outcome)
             return outcome
         results = direct_matches
@@ -1739,8 +1824,16 @@ def answer_question_result(question: str) -> AnswerOutcome:
         _set_cached_answer(question, outcome)
         return outcome
     normalized = _normalize_model_output(response.content)
-    kind = "not_found" if normalized == NOT_FOUND_RESPONSE else "answer"
-    outcome = AnswerOutcome(text=normalized, kind=kind)
+    if normalized == NOT_FOUND_RESPONSE:
+        outcome = AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
+        _set_cached_answer(question, outcome)
+        return outcome
+    payload = _parse_exact_quote_payload(normalized)
+    if payload is None:
+        outcome = AnswerOutcome(text=NOT_FOUND_RESPONSE, kind="not_found")
+        _set_cached_answer(question, outcome)
+        return outcome
+    outcome = AnswerOutcome(text=_render_final_answer(question, payload), kind="answer")
     _set_cached_answer(question, outcome)
     return outcome
 

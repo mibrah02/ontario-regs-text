@@ -17,9 +17,9 @@ def main() -> None:
     # Keep the test local and deterministic by replacing networked services.
     main_module.answer_question_result = lambda question: AnswerOutcome(
         text=(
-            "2026 Ontario Hunting Regulations Summary, p.12: "
-            '"Sample exact sentence from PDF." ontario.ca/hunting\n'
-            "Informational only. Not legal advice. Verify current regs."
+            'The summary says: "Sample exact sentence from PDF." '
+            '(2026 Ontario Hunting Regulations Summary, p.12, ontario.ca/hunting). '
+            'Verify current regs.'
         ),
         kind="answer",
     )

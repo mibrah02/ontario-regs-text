@@ -43,6 +43,13 @@ class _FakeVectorStore:
 
 
 class LlmResilienceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_render = rag_module._render_final_answer
+        rag_module._render_final_answer = lambda question, payload: f'The summary says: "{payload.exact_quote}" ({payload.source_title}, p.{payload.page}, {payload.citation_url}). Verify current regs.'
+
+    def tearDown(self) -> None:
+        rag_module._render_final_answer = self.original_render
+
     def test_intake_timeout_falls_back_quickly(self) -> None:
         original_get_intake_model = rag_module._get_intake_model
         original_timeout = rag_module.INTAKE_TIMEOUT_SECONDS
@@ -113,7 +120,7 @@ class LlmResilienceTests(unittest.TestCase):
                 def invoke(self, prompt: str):
                     calls["count"] += 1
                     return _SlowResponse(
-                        '2026 Ontario Hunting Regulations Summary, p.12: "Cached sample." ontario.ca/hunting\nInformational only. Not legal advice. Verify current regs.'
+                        '2026 Ontario Hunting Regulations Summary, p.12: "Cached sample." ontario.ca/hunting\nVerify current regs.'
                     )
 
             rag_module.ANSWER_CACHE.clear()
@@ -146,7 +153,7 @@ class LlmResilienceTests(unittest.TestCase):
             main_module.answer_question_result = lambda question: AnswerOutcome(
                 text=(
                     '2026 Ontario Hunting Regulations Summary, p.96: "Cottontail and European hare 36, 37, 42–50, 53–95 Daily limit of 5 Cottontail and 3 European Hare. Possession limit of 15 of each species." '
-                    'ontario.ca/hunting\nInformational only. Not legal advice. Verify current regs.'
+                    'ontario.ca/hunting\nVerify current regs.'
                 ),
                 kind="answer",
             )
@@ -170,7 +177,7 @@ class LlmResilienceTests(unittest.TestCase):
             main_module.answer_question_result = lambda question: AnswerOutcome(
                 text=(
                     '2026 Ontario Hunting Regulations Summary, p.12: "Sample exact sentence from PDF." '
-                    'ontario.ca/hunting\nInformational only. Not legal advice. Verify current regs.'
+                    'ontario.ca/hunting\nVerify current regs.'
                 ),
                 kind="answer",
             )

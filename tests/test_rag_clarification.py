@@ -8,10 +8,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import app.rag as rag_module
 from app.rag import answer_question_result
 
 
 class RagClarificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_render = rag_module._render_final_answer
+        rag_module._render_final_answer = lambda question, payload: f'{payload.source_title}, p.{payload.page}: "{payload.exact_quote}" {payload.citation_url} Verify current regs.'
+
+    def tearDown(self) -> None:
+        rag_module._render_final_answer = self.original_render
+
     def test_deer_season_without_wmu_or_method_requests_both(self) -> None:
         result = answer_question_result("when is deer season")
         self.assertEqual(result.kind, "clarify")

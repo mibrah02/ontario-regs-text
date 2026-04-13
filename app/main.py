@@ -31,7 +31,7 @@ from app.stripe import construct_event, get_checkout_url, handle_checkout_comple
 load_dotenv()
 
 FREE_QUESTION_LIMIT = 3
-NOT_FOUND_RESPONSE = "Not found in the official Ontario hunting or Ontario migratory bird summaries. Check ontario.ca or canada.ca. Info only. Not legal advice. Verify current regs."
+NOT_FOUND_RESPONSE = "Not found in the official Ontario hunting or Ontario migratory bird summaries. Check ontario.ca or canada.ca. Verify current regs."
 GUIDANCE_RESPONSE = (
     "Ask an Ontario hunting question, for example: hunter orange requirement, deer season WMU 65 bows only, rabbit daily limit, or duck daily bag limit in the Southern District. "
     "I reply with the exact quote from the official summary. Info only. Not legal advice. Verify current regs."
@@ -142,7 +142,9 @@ def _answer_components(reply_text: str) -> tuple[str, str, str] | None:
     prefix = normalized[:first_quote]
     quote = normalized[first_quote + 1:last_quote]
     suffix = normalized[last_quote + 2:].strip()
-    if ', p.' not in prefix or not quote or not suffix:
+    has_page = "p." in normalized.lower() or "page " in normalized.lower()
+    has_citation = "ontario.ca/hunting" in normalized.lower() or "canada.ca/migratory-game-bird-hunting" in normalized.lower()
+    if not quote or not suffix or not has_page or not has_citation:
         return None
     return prefix, quote, suffix
 
