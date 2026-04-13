@@ -144,6 +144,7 @@ class SmsGuidanceTests(unittest.TestCase):
         third = main_module.build_sms_reply(self.phone, "WMU 65")
         self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", third)
         self.assertIn("WMUs 60 to 87E", third)
+        self.assertLessEqual(main_module._estimate_sms_segments(third), main_module.SMS_SEGMENT_LIMIT)
 
 
 if __name__ == "__main__":

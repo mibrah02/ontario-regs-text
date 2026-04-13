@@ -149,7 +149,7 @@ def _answer_components(reply_text: str) -> tuple[str, str, str] | None:
 
 def _question_has_wmu(question: str) -> bool:
     lowered = question.lower()
-    return "wmu" in lowered or bool(re.search(r"\d{1,3}[A-Z]?", question, re.IGNORECASE))
+    return "wmu" in lowered or bool(re.search(r"\b\d{1,3}[A-Z]?\b", question, re.IGNORECASE))
 
 
 def _oversize_answer_fallback(question: str, reply_text: str) -> str | None:
@@ -171,7 +171,7 @@ def _question_keywords(question: str) -> set[str]:
 
 
 def _extract_first_wmu(question: str) -> str | None:
-    match = re.search(r"(?:WMU\s*)?(\d{1,3}[A-Z]?)", question, re.IGNORECASE)
+    match = re.search(r"\b(?:WMU\s*)?(\d{1,3}[A-Z]?)\b", question, re.IGNORECASE)
     return match.group(1).upper() if match else None
 
 
@@ -183,7 +183,7 @@ def _wmu_in_group(target_wmu: str, group: str) -> bool:
     for start, end in re.findall(r"(\d{1,3})\s+to\s+(\d{1,3})[A-Z]?", group, re.IGNORECASE):
         if int(start) <= target_num <= int(end):
             return True
-    for single in re.findall(r"(\d{1,3})[A-Z]?", group):
+    for single in re.findall(r"\b(\d{1,3})[A-Z]?\b", group):
         if int(single) == target_num:
             return True
     return False
@@ -191,32 +191,32 @@ def _wmu_in_group(target_wmu: str, group: str) -> bool:
 
 def _shorten_migratory_limit_quote(question: str, quote: str) -> str | None:
     lowered = question.lower()
-    if not any(term in lowered for term in ("daily", "bag", "limit")):
-        return None
     if "district" not in quote.lower():
         return None
 
-    season_match = re.search(
-        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:\s+to\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2})?",
-        quote,
-        re.IGNORECASE,
-    )
-    start_index = season_match.end() if season_match else 0
-    quantity_matches = list(re.finditer(r"(?:No limit|N/A|\d{1,2})(?:\s*\([^)]*\))?", quote[start_index:]))
-    if not quantity_matches:
-        return None
-    prefix = quote[: start_index].strip() if start_index else quote[: quantity_matches[0].start()].strip()
-    groups = [match.group(0).strip() for match in quantity_matches]
     target_wmu = _extract_first_wmu(question)
-    kept: list[str] = []
+    paren_groups = re.findall(r"\([^)]*\)", quote)
+    matching_group = None
     if target_wmu:
-        kept = [group for group in groups if _wmu_in_group(target_wmu, group)]
-        if kept:
-            kept = kept[:1]
-    if not kept:
-        kept = groups[::2] or groups[:1]
-    candidate = f"{prefix} {' '.join(kept)}".strip()
-    return candidate if candidate and candidate != quote else None
+        for group in paren_groups:
+            if _wmu_in_group(target_wmu, group):
+                matching_group = group
+                break
+
+    if any(term in lowered for term in ("daily", "bag", "limit")):
+        if matching_group:
+            number_match = re.search(r"(No limit|N/A|\d{1,2})\s*" + re.escape(matching_group), quote)
+            if number_match:
+                return f"{number_match.group(1)} {matching_group}".strip()
+
+    if "possession" in lowered and matching_group:
+        numbers = list(re.finditer(r"(No limit|N/A|\d{1,2})\s*" + re.escape(matching_group), quote))
+        if len(numbers) >= 2:
+            return f"{numbers[-1].group(1)} {matching_group}".strip()
+        if numbers:
+            return f"{numbers[0].group(1)} {matching_group}".strip()
+
+    return None
 
 
 def _trim_fragment_to_relevant_start(question: str, fragment: str) -> str:

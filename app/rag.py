@@ -343,6 +343,26 @@ def _format_exact_quote(document: Document) -> str:
     )
 
 
+def _format_exact_quote_for_question(document: Document, question: str) -> str:
+    page = document.metadata.get("page_num", "?")
+    quote = _normalize_inline(document.page_content)
+    if document.metadata.get("chunk_type") == "table_row":
+        quote = _compress_repeated_table_row(quote)
+
+    if document.metadata.get("source_kind") == "migratory":
+        narrowed_quote = _extract_migratory_limit_quote_for_question(question, quote)
+        if narrowed_quote:
+            quote = narrowed_quote
+
+    quote = quote.replace('"', '\\"')
+    source_title = document.metadata.get("source_title", "Official Hunting Summary")
+    citation_url = document.metadata.get("citation_url", PROVINCIAL_CITATION_URL)
+    return (
+        f'{source_title}, p.{page}: "{quote}" {citation_url}\n'
+        "Informational only. Not legal advice. Verify current regs."
+    )
+
+
 def _extract_species_terms(question: str) -> set[str]:
     lowered = question.lower()
     return {label for pattern, label in SPECIES_PATTERNS.items() if pattern in lowered}
@@ -411,6 +431,66 @@ def _doc_matches_species(document: Document, species_terms: set[str]) -> bool:
     if "waterfowl" in species_terms and doc_species in WATERFOWL_SPECIES:
         return True
     return False
+
+
+def _extract_first_wmu(question: str) -> str | None:
+    terms = sorted(_extract_wmu_terms(question))
+    return terms[0] if terms else None
+
+
+def _wmu_in_group(target_wmu: str, group: str) -> bool:
+    target_match = re.match(r"(\d{1,3})", target_wmu)
+    if not target_match:
+        return False
+    target_num = int(target_match.group(1))
+    for start, end in re.findall(r"(\d{1,3})\s+to\s+(\d{1,3})[A-Z]?", group, re.IGNORECASE):
+        if int(start) <= target_num <= int(end):
+            return True
+    for single in re.findall(r"\b(\d{1,3})[A-Z]?\b", group):
+        if int(single) == target_num:
+            return True
+    return False
+
+
+def _is_waterfowl_limit_question(question: str) -> bool:
+    lowered = question.lower()
+    species_terms = _extract_species_terms(question)
+    return bool(species_terms.intersection(WATERFOWL_SPECIES)) and any(term in lowered for term in WATERFOWL_DETAIL_TERMS)
+
+
+def _migratory_row_has_wmu_specific_limits(document: Document) -> bool:
+    text = _normalize_inline(document.page_content)
+    return bool(re.search(r"(No limit|N/A|\d{1,2})\s*\([^)]*\bWMU[^)]*\)", text, re.IGNORECASE))
+
+
+def _migratory_limit_requires_wmu(question: str, document: Document) -> bool:
+    if document.metadata.get("source_kind") != "migratory":
+        return False
+    if document.metadata.get("chunk_type") != "table_row":
+        return False
+    if not _is_waterfowl_limit_question(question):
+        return False
+    if _extract_wmu_terms(question):
+        return False
+    return _migratory_row_has_wmu_specific_limits(document)
+
+
+def _extract_migratory_limit_quote_for_question(question: str, quote: str) -> str | None:
+    if not _is_waterfowl_limit_question(question):
+        return None
+
+    target_wmu = _extract_first_wmu(question)
+    if not target_wmu:
+        return None
+
+    matches = re.finditer(r"(No limit|N/A|\d{1,2})\s*(\([^)]*\bWMU[^)]*\))", quote, re.IGNORECASE)
+    for match in matches:
+        value = match.group(1)
+        group = match.group(2)
+        if _wmu_in_group(target_wmu, group):
+            return f"{value} {group}".strip()
+
+    return None
 
 
 def _direct_structured_match(vectorstore: FAISS, question: str) -> list[Document]:
@@ -988,6 +1068,29 @@ def _supported_species_prompt(species: str) -> str:
     return f"{intro} Ask one specific {fallback_species} question, for example: {example_text}. Informational only. Not legal advice. Verify current regs."
 
 
+def _deterministic_intake_outcome(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome | None:
+    normalized = _normalize_intake_key(message)
+    pending_question = (pending_state or {}).get("question", "").strip()
+    expected_detail = (pending_state or {}).get("expected_detail", "").strip() or None
+
+    if pending_question:
+        if normalized in {"thanks", "thank you", "thx", "ok", "okay", "cool", "got it", "lol", "haha", "what do you mean", "which one", "can you clarify", "clarify", "not sure", "i dont know", "i do not know"}:
+            return IntakeOutcome(
+                action="clarify",
+                reply_text=_clarification_reminder_text(expected_detail),
+                pending_question=pending_question,
+                expected_detail=expected_detail,
+            )
+        if _looks_like_follow_up_fragment(message, expected_detail):
+            combined = f"{pending_question} {message.strip()}".strip()
+            return IntakeOutcome(action="search", normalized_question=combined)
+
+    if not pending_question and len(re.findall(r"\w+", normalized)) <= 3 and (_question_specifies_method(normalized) or bool(_extract_wmu_terms(normalized)) or bool(_extract_district_terms(normalized))):
+        return IntakeOutcome(action="guide", reply_text=INTAKE_GUIDANCE_RESPONSE)
+
+    return None
+
+
 def _fallback_interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
     normalized = _normalize_intake_key(message)
     pending_question = (pending_state or {}).get("question", "").strip()
@@ -1048,6 +1151,10 @@ def _strip_json_fence(text: str) -> str:
 
 
 def interpret_incoming_message(message: str, pending_state: dict[str, str] | None = None) -> IntakeOutcome:
+    deterministic = _deterministic_intake_outcome(message, pending_state)
+    if deterministic is not None:
+        return deterministic
+
     pending_question = (pending_state or {}).get("question", "").strip()
     expected_detail = (pending_state or {}).get("expected_detail", "").strip() or ""
     prompt = (
@@ -1313,6 +1420,16 @@ def _build_waterfowl_district_clarification(question: str) -> AnswerOutcome:
     )
 
 
+def _build_waterfowl_wmu_clarification(question: str) -> AnswerOutcome:
+    species_terms = _extract_species_terms(question)
+    species_name = _pretty_species_name(next(iter(species_terms))) if species_terms else "waterfowl"
+    return _clarification_outcome(
+        f"Need one more detail for the exact {species_name} limit: reply with your WMU, for example WMU 65. Informational only. Not legal advice. Verify current regs.",
+        question,
+        "wmu",
+    )
+
+
 def _results_are_ambiguous(question: str, documents: list[Document]) -> bool:
     if _question_specifies_method(question):
         return False
@@ -1412,7 +1529,12 @@ def answer_question_result(question: str) -> AnswerOutcome:
     direct_matches = _direct_structured_match(vectorstore, question)
     if direct_matches:
         if len(direct_matches) == 1:
-            outcome = AnswerOutcome(text=_format_exact_quote(direct_matches[0]), kind="answer")
+            direct_match = direct_matches[0]
+            if _migratory_limit_requires_wmu(question, direct_match):
+                outcome = _build_waterfowl_wmu_clarification(question)
+                _set_cached_answer(question, outcome)
+                return outcome
+            outcome = AnswerOutcome(text=_format_exact_quote_for_question(direct_match, question), kind="answer")
             _set_cached_answer(question, outcome)
             return outcome
         results = direct_matches

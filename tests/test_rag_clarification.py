@@ -60,16 +60,24 @@ class RagClarificationTests(unittest.TestCase):
         self.assertEqual(result.expected_detail, "district")
         self.assertIn("Southern or Central District", result.text)
 
-    def test_duck_daily_limit_with_district_returns_federal_quote(self) -> None:
+    def test_duck_daily_limit_with_district_requests_wmu(self) -> None:
         result = answer_question_result("duck daily limit in Southern District")
-        self.assertEqual(result.kind, "answer")
-        self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
-        self.assertIn("canada.ca/migratory-game-bird-hunting", result.text)
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "wmu")
+        self.assertIn("reply with your WMU", result.text)
 
-    def test_duck_daily_limit_with_short_district_returns_federal_quote(self) -> None:
+    def test_duck_daily_limit_with_short_district_requests_wmu(self) -> None:
         result = answer_question_result("duck daily limit Southern")
+        self.assertEqual(result.kind, "clarify")
+        self.assertEqual(result.expected_detail, "wmu")
+        self.assertIn("reply with your WMU", result.text)
+
+    def test_duck_daily_limit_with_district_and_wmu_returns_short_quote(self) -> None:
+        result = answer_question_result("duck daily limit in Southern District WMU 65")
         self.assertEqual(result.kind, "answer")
         self.assertIn("Ontario Summary of Migratory Birds Hunting Regulations", result.text)
+        self.assertIn("p.4", result.text)
+        self.assertIn("6 (in WMUs 60 to 87E", result.text)
 
 
 if __name__ == "__main__":
